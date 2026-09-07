@@ -41,6 +41,7 @@ local EXT_TO_LANG = {
   bash = "bash",
   zsh = "bash",
   lua = "lua_lang",
+  luau = "luau",
   ex = "elixir",
   exs = "elixir",
   md = "markdown",
