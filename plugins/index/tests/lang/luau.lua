@@ -81,3 +81,54 @@ type ReallyLong = {
   local out = idx(src, "luau")
   has(out, { "types:", "type ReallyLong = { one: string, two: string,", "[truncated]" })
 end)
+
+case("luau_spec_syntax", function()
+  local src = [==[
+const MAX_RETRIES: number = 3
+const VERSION = "1.0"
+
+const function greet(name: string): string
+	return `hi {name}`
+end
+
+@native const function fast(x: number)
+end
+
+export type function serialize<T>(value: T): string
+	return value
+end
+
+declare function warn<T...>(...: T...): ()
+
+declare game: DataModel
+
+declare extern type Instance extends RBXScriptSignal
+	read Name: string
+	Parent: Instance?
+	function FindFirstChild(self, name: string): Instance?
+end
+
+declare class LegacyService
+	AutoSave: boolean
+	function Save(self): boolean
+end
+
+@native function step(dt: number)
+end
+]==]
+  local out = idx(src, "luau")
+  has(out, {
+    "consts:",
+    "MAX_RETRIES = 3",
+    'VERSION = "1.0"',
+    "game: DataModel",
+    "types:",
+    "export type function serialize<T>(value: T): string",
+    "extern type Instance extends RBXScriptSignal",
+    "fns:",
+    "greet(name: string): string",
+    "fast(x: number)",
+    "warn<T...>(...: T...)",
+    "step(dt: number)",
+  })
+end)
