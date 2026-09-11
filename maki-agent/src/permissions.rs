@@ -1878,7 +1878,11 @@ mod tests {
     #[test]
     fn path_scoped_cd_covers_directory_and_below() {
         assert_eq!(
-            proposed_rules(&ToolKey::native("bash"), &["cd /repo".into()], RuleShape::PathScoped),
+            proposed_rules(
+                &ToolKey::native("bash"),
+                &["cd /repo".into()],
+                RuleShape::PathScoped
+            ),
             vec!["cd /repo", "cd /repo/*"]
         );
     }
