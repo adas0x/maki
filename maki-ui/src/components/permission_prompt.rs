@@ -85,6 +85,7 @@ const RULE_EDIT_HINTS: &[(&str, &str)] = &[
 ];
 const SHAPE_HINT: (&str, &str) = ("←/→", "Rule shape");
 const EDIT_HINT: (&str, &str) = ("e", "Edit rules");
+const EDIT_CUE: &str = " (e edits)";
 const CUSTOM_SHAPE_LABEL: &str = "custom";
 const MATCH_MARK: &str = "✓ ";
 const MISS_MARK: &str = "✗ ";
@@ -396,14 +397,15 @@ impl PermissionPrompt {
         {
             return None;
         }
-        if state.confirms_allow_rules() {
+        let offers_shapes = rule_shapes(tool).len() > 1;
+        if state.confirms_allow_rules() || *state == PromptState::Normal {
             match key.code {
                 KeyCode::Right | KeyCode::Left => {
                     *shape = cycled_shape(tool, *shape, key.code == KeyCode::Right);
                     *rules = proposed_rules(tool, scopes, *shape);
                     return None;
                 }
-                KeyCode::Char('e') => {
+                KeyCode::Char('e') if offers_shapes => {
                     *rule_editor = Some(Box::new(RuleEditor::over(rules)));
                     return None;
                 }
@@ -428,9 +430,14 @@ impl PermissionPrompt {
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => Some(answer),
                 _ => {
+                    let hand_edited = rule_shapes(tool)
+                        .iter()
+                        .all(|s| proposed_rules(tool, scopes, *s) != *rules);
                     *state = PromptState::Normal;
                     *shape = RuleShape::default();
-                    *rules = proposed_rules(tool, scopes, *shape);
+                    if !hand_edited {
+                        *rules = proposed_rules(tool, scopes, *shape);
+                    }
                     None
                 }
             };
@@ -500,6 +507,7 @@ impl PermissionPrompt {
         };
         let (state, buffer) = (&self.state, &self.buffer);
         let picking_shape = state.confirms_allow_rules();
+        let previewing = picking_shape || rule_editor.is_some();
         let offers_shapes = rule_shapes(tool).len() > 1;
         let live_rules = match rule_editor {
             Some(editor) => editor.rules(),
@@ -527,7 +535,7 @@ impl PermissionPrompt {
         for (i, s) in scopes.iter().enumerate() {
             let label = if i == 0 { "scope " } else { "    + " };
             let mut spans = vec![Span::raw("  "), Span::styled(label, label_style)];
-            if picking_shape {
+            if previewing {
                 let (mark, style) = if live_rules.iter().any(|rule| scope_matches(rule, s)) {
                     (MATCH_MARK, t.tool_success)
                 } else {
@@ -556,12 +564,18 @@ impl PermissionPrompt {
                 }
             }
             None if picking_shape || *rules != *scopes => {
+                let cue = *state == PromptState::Normal && offers_shapes;
+                let last = rules.len().saturating_sub(1);
                 for (i, rule) in rules.iter().enumerate() {
-                    lines.push(Line::from(vec![
+                    let mut spans = vec![
                         Span::raw("  "),
                         Span::styled(allow_label(i), label_style),
                         Span::styled(rule.clone(), value_style),
-                    ]));
+                    ];
+                    if cue && i == last {
+                        spans.push(Span::styled(EDIT_CUE, t.tool_dim));
+                    }
+                    lines.push(Line::from(spans));
                 }
             }
             None => {}
@@ -634,12 +648,12 @@ impl PermissionPrompt {
                 lines.push(hint_line(DENY_GUIDANCE_HINTS));
             }
             PromptState::Normal => {
-                let rows: &[&[(&str, &str)]] = if *project_trusted {
-                    &[HINT_ALLOW_ROW, HINT_DENY_ROW]
+                let rows = if *project_trusted {
+                    [HINT_ALLOW_ROW, HINT_DENY_ROW]
                 } else {
-                    &[HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED]
+                    [HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED]
                 };
-                lines.extend(aligned_hint_rows(rows));
+                lines.extend(aligned_hint_rows(&rows));
             }
         }
         lines.push(Line::raw(""));
@@ -672,8 +686,8 @@ mod tests {
 
     use super::{
         CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
-        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, MATCH_MARK, MISS_MARK,
-        Overlay, PermissionPrompt, PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER,
+        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, EDIT_CUE, MATCH_MARK,
+        MISS_MARK, Overlay, PermissionPrompt, PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER,
         UNTRUSTED_NOTICE,
     };
 
@@ -750,6 +764,43 @@ mod tests {
                 "{code:?} answered early"
             );
         }
+    }
+
+    #[test]
+    fn edit_opens_from_the_initial_prompt() {
+        let mut prompt = open_prompt();
+        press(&mut prompt, &[KeyCode::Char('e')]);
+        assert!(editing(&prompt));
+    }
+
+    #[test]
+    fn initial_prompt_cues_editing_for_shape_tools_only() {
+        assert!(rendered(&open_prompt()).contains(EDIT_CUE));
+        let mcp = open_with(ToolKey::parse("srv.tool").unwrap(), URL_SCOPE);
+        assert!(!rendered(&mcp).contains(EDIT_CUE));
+    }
+
+    #[test]
+    fn edited_rules_survive_a_cancelled_confirm() {
+        let mut prompt = open_prompt();
+        press(
+            &mut prompt,
+            &[KeyCode::Char('e'), KeyCode::Char('X'), KeyCode::Enter],
+        );
+        press(&mut prompt, &[KeyCode::Char('s'), KeyCode::Char('q')]);
+        assert_eq!(state_of(&prompt), PromptState::Normal);
+        assert!(rendered(&prompt).contains("execute *X"));
+    }
+
+    #[test]
+    fn shape_cycled_rules_reset_on_cancelled_confirm() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(
+            &mut prompt,
+            &[KeyCode::Right, KeyCode::Char('s'), KeyCode::Char('q')],
+        );
+        assert_eq!(state_of(&prompt), PromptState::Normal);
+        assert!(rendered(&prompt).contains("cd *"));
     }
 
     fn ctrl_c() -> KeyEvent {
@@ -1115,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_confirm_forgets_edited_rules() {
+    fn cancelled_confirm_keeps_edited_rules() {
         let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
         press(&mut prompt, &[KeyCode::Char('s'), KeyCode::Char('e')]);
         type_text(&mut prompt, "x");
@@ -1124,8 +1175,15 @@ mod tests {
         press(&mut prompt, &[KeyCode::Char('a')]);
         assert_eq!(
             rules_of(answer(&mut prompt, key(KeyCode::Enter))),
-            vec!["cd *"]
+            vec!["cd *x"]
         );
+    }
+
+    #[test]
+    fn preview_follows_editing_from_the_initial_prompt() {
+        let mut prompt = open_two_scopes();
+        press(&mut prompt, &[KeyCode::Char('e')]);
+        assert_eq!(scope_marks(&prompt), vec![MATCH_MARK, MATCH_MARK]);
     }
 
     #[test]
@@ -1141,14 +1199,6 @@ mod tests {
             rules_of(answer(&mut prompt, key(KeyCode::Enter))),
             vec!["cd *", "ls * --color"]
         );
-    }
-
-    #[test]
-    fn e_in_normal_state_is_not_a_command() {
-        let mut prompt = open_prompt();
-        press(&mut prompt, &[KeyCode::Char('e')]);
-        assert_eq!(state_of(&prompt), PromptState::Normal);
-        assert!(!editing(&prompt));
     }
 
     /// The preview follows the rules as they are typed: a rule that no longer
