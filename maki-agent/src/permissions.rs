@@ -1000,13 +1000,13 @@ fn generalize_bash_segment(segment: &str) -> String {
 /// [`scope_matches`]) but not `cd` anywhere else. A builtin without a path
 /// argument, or with a flag in its place, has nothing to pin to and takes the
 /// wildcard shape.
-fn path_scoped_bash_segment(segment: &str) -> String {
+fn path_scoped_bash_segment(segment: &str) -> Vec<String> {
     let mut tokens = segment.split_whitespace();
     match (tokens.next(), tokens.next()) {
         (Some(cmd), Some(arg)) if PATH_COMMANDS.contains(&cmd) && !arg.starts_with('-') => {
-            format!("{cmd} {arg} *")
+            vec![format!("{cmd} {arg}"), format!("{cmd} {arg}/*")]
         }
-        _ => generalize_bash_segment(segment),
+        _ => vec![generalize_bash_segment(segment)],
     }
 }
 
@@ -1035,12 +1035,15 @@ pub fn rule_shapes(tool: &ToolKey) -> &'static [RuleShape] {
 }
 
 /// The rules an approval of `scopes` would write under `shape`, deduplicated
-/// in scope order. MCP ignores the shape (see [`rule_shapes`]).
+/// in scope order. A scope may propose more than one rule: a path-scoped `cd`
+/// needs the exact directory and a `/*` child rule, since `" *"` patterns
+/// cover "bare or more args", not paths below it. MCP ignores the shape (see
+/// [`rule_shapes`]).
 pub fn proposed_rules(tool: &ToolKey, scopes: &[String], shape: RuleShape) -> Vec<String> {
     let mut seen = HashSet::new();
     scopes
         .iter()
-        .map(|s| propose_scope(tool, s, shape))
+        .flat_map(|s| propose_scope(tool, s, shape))
         .filter(|g| seen.insert(g.clone()))
         .collect()
 }
@@ -1049,14 +1052,16 @@ pub fn generalized_scopes(tool: &ToolKey, scopes: &[String]) -> Vec<String> {
     proposed_rules(tool, scopes, RuleShape::Wildcard)
 }
 
-fn propose_scope(tool: &ToolKey, scope: &str, shape: RuleShape) -> String {
+fn propose_scope(tool: &ToolKey, scope: &str, shape: RuleShape) -> Vec<String> {
     match (tool, shape) {
-        (ToolKey::McpTool { .. } | ToolKey::McpServer { .. }, _) => generalize_scope(tool, scope),
-        (_, RuleShape::Exact) => scope.to_string(),
+        (ToolKey::McpTool { .. } | ToolKey::McpServer { .. }, _) => {
+            vec![generalize_scope(tool, scope)]
+        }
+        (_, RuleShape::Exact) => vec![scope.to_string()],
         (ToolKey::Native(name), RuleShape::PathScoped) if name.as_ref() == BASH_TOOL => {
             path_scoped_bash_segment(scope)
         }
-        (_, RuleShape::Wildcard | RuleShape::PathScoped) => generalize_scope(tool, scope),
+        (_, RuleShape::Wildcard | RuleShape::PathScoped) => vec![generalize_scope(tool, scope)],
     }
 }
 
@@ -1860,8 +1865,6 @@ mod tests {
         assert_eq!(result, vec!["cargo *", "git *"]);
     }
 
-    #[test_case("cd /repo", RuleShape::PathScoped => "cd /repo *" ; "cd_pins_to_path")]
-    #[test_case("pushd src/lib", RuleShape::PathScoped => "pushd src/lib *" ; "pushd_pins_to_path")]
     #[test_case("cd", RuleShape::PathScoped => "cd *" ; "bare_cd_has_no_path")]
     #[test_case("cd -P /repo", RuleShape::PathScoped => "cd *" ; "flag_is_not_a_path")]
     #[test_case("cargo test --all", RuleShape::PathScoped => "cargo *" ; "non_path_command_falls_back")]
@@ -1870,6 +1873,26 @@ mod tests {
     #[test_case("cd /repo", RuleShape::Wildcard => "cd *" ; "wildcard_is_today")]
     fn proposed_bash_rule(segment: &str, shape: RuleShape) -> String {
         proposed_rules(&ToolKey::native("bash"), &[segment.into()], shape).remove(0)
+    }
+
+    #[test]
+    fn path_scoped_cd_covers_directory_and_below() {
+        assert_eq!(
+            proposed_rules(&ToolKey::native("bash"), &["cd /repo".into()], RuleShape::PathScoped),
+            vec!["cd /repo", "cd /repo/*"]
+        );
+    }
+
+    #[test]
+    fn path_scoped_pushd_covers_directory_and_below() {
+        assert_eq!(
+            proposed_rules(
+                &ToolKey::native("bash"),
+                &["pushd src/lib".into()],
+                RuleShape::PathScoped
+            ),
+            vec!["pushd src/lib", "pushd src/lib/*"]
+        );
     }
 
     #[test_case(RuleShape::Wildcard => vec!["cargo *"] ; "wildcard_groups_binary")]
