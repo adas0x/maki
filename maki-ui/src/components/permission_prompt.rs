@@ -7,7 +7,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
+use maki_agent::permissions::{
+    DEFAULT_DENY_GUIDANCE, PermissionAnswer, RuleShape, proposed_rules, rule_shapes,
+};
 use maki_config::ToolKey;
 
 use crate::components::Overlay;
@@ -76,6 +78,31 @@ const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
 
 const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
 const QUEUED_NOTICE: &str = "more request(s) waiting";
+const SHAPE_HINT: (&str, &str) = ("←/→", "Rule shape");
+
+fn shape_label(shape: RuleShape) -> &'static str {
+    match shape {
+        RuleShape::Exact => "exact",
+        RuleShape::Wildcard => "wildcard",
+        RuleShape::PathScoped => "path-scoped",
+    }
+}
+
+fn cycled_shape(tool: &ToolKey, current: RuleShape, forward: bool) -> RuleShape {
+    let shapes = rule_shapes(tool);
+    let index = shapes.iter().position(|s| *s == current).unwrap_or(0);
+    let step = if forward { 1 } else { shapes.len() - 1 };
+    shapes[(index + step) % shapes.len()]
+}
+
+fn confirm_hints(base: &[(&str, &str)], offers_shapes: bool) -> Line<'static> {
+    if !offers_shapes {
+        return hint_line(base);
+    }
+    let mut hints = base.to_vec();
+    hints.push(SHAPE_HINT);
+    hint_line(&hints)
+}
 
 fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
     let t = theme::current();
@@ -120,13 +147,24 @@ pub(crate) enum PromptState {
     DenyEditing,
 }
 
+impl PromptState {
+    fn confirms_allow_rules(self) -> bool {
+        matches!(
+            self,
+            Self::ConfirmAllowAlwaysProject
+                | Self::ConfirmAllowAlwaysGlobal
+                | Self::ConfirmAllowSession
+        )
+    }
+}
+
 struct Request {
     id: String,
     tool: ToolKey,
     scopes: Vec<String>,
     subagent_id: Option<String>,
-    allow_scopes: Vec<String>,
     project_trusted: bool,
+    shape: RuleShape,
 }
 
 /// An answer carries the ask it settles: the agent only accepts one naming the
@@ -182,19 +220,13 @@ impl PermissionPrompt {
         subagent_id: Option<String>,
         project_trusted: bool,
     ) {
-        let allow_scopes = generalized_scopes(&tool, &scopes);
-        let allow_scopes = if allow_scopes == scopes {
-            vec![]
-        } else {
-            allow_scopes
-        };
         self.queue.push_back(Request {
             id,
             tool,
             scopes,
             subagent_id,
-            allow_scopes,
             project_trusted,
+            shape: RuleShape::default(),
         });
     }
 
@@ -232,6 +264,12 @@ impl PermissionPrompt {
         if !self.is_open() {
             return None;
         }
+        let Request {
+            tool,
+            scopes,
+            shape,
+            ..
+        } = self.queue.front_mut()?;
         let (state, buffer) = (&mut self.state, &mut self.buffer);
         if is_ctrl(&key) && key.code == KeyCode::Char('c') {
             return Some(PermissionAnswer::Deny);
@@ -263,16 +301,27 @@ impl PermissionPrompt {
         {
             return None;
         }
+        if state.confirms_allow_rules() {
+            let forward = match key.code {
+                KeyCode::Right => Some(true),
+                KeyCode::Left => Some(false),
+                _ => None,
+            };
+            if let Some(forward) = forward {
+                *shape = cycled_shape(tool, *shape, forward);
+                return None;
+            }
+        }
         let confirm_answer = match *state {
-            PromptState::ConfirmAllowAlwaysProject => {
-                Some(PermissionAnswer::AllowAlwaysProject { rules: vec![] })
-            }
-            PromptState::ConfirmAllowAlwaysGlobal => {
-                Some(PermissionAnswer::AllowAlwaysGlobal { rules: vec![] })
-            }
-            PromptState::ConfirmAllowSession => {
-                Some(PermissionAnswer::AllowSession { rules: vec![] })
-            }
+            PromptState::ConfirmAllowAlwaysProject => Some(PermissionAnswer::AllowAlwaysProject {
+                rules: proposed_rules(tool, scopes, *shape),
+            }),
+            PromptState::ConfirmAllowAlwaysGlobal => Some(PermissionAnswer::AllowAlwaysGlobal {
+                rules: proposed_rules(tool, scopes, *shape),
+            }),
+            PromptState::ConfirmAllowSession => Some(PermissionAnswer::AllowSession {
+                rules: proposed_rules(tool, scopes, *shape),
+            }),
             PromptState::ConfirmDenyAlwaysProject => Some(PermissionAnswer::DenyAlwaysProject),
             PromptState::ConfirmDenyAlwaysGlobal => Some(PermissionAnswer::DenyAlwaysGlobal),
             _ => None,
@@ -282,6 +331,7 @@ impl PermissionPrompt {
                 KeyCode::Char('y') | KeyCode::Enter => Some(answer),
                 _ => {
                     *state = PromptState::Normal;
+                    *shape = RuleShape::default();
                     None
                 }
             };
@@ -329,14 +379,17 @@ impl PermissionPrompt {
             tool,
             scopes,
             subagent_id,
-            allow_scopes,
             project_trusted,
+            shape,
             ..
         }) = self.queue.front()
         else {
             return vec![];
         };
         let (state, buffer) = (&self.state, &self.buffer);
+        let picking_shape = state.confirms_allow_rules();
+        let offers_shapes = rule_shapes(tool).len() > 1;
+        let allow_scopes = proposed_rules(tool, scopes, *shape);
         let t = theme::current();
         let label_style = t.tool_dim;
         let value_style = Style::new().fg(t.foreground);
@@ -365,7 +418,7 @@ impl PermissionPrompt {
             ]));
         }
 
-        if !allow_scopes.is_empty() {
+        if picking_shape || allow_scopes != *scopes {
             for (i, g) in allow_scopes.iter().enumerate() {
                 let label = if i == 0 { "allow " } else { "    + " };
                 lines.push(Line::from(vec![
@@ -374,6 +427,13 @@ impl PermissionPrompt {
                     Span::styled(g.clone(), value_style),
                 ]));
             }
+        }
+        if picking_shape && offers_shapes {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("shape ", label_style),
+                Span::styled(shape_label(*shape), value_style),
+            ]));
         }
 
         if *state == PromptState::DenyEditing {
@@ -414,17 +474,18 @@ impl PermissionPrompt {
         lines.push(Line::raw(""));
         match *state {
             PromptState::ConfirmAllowAlwaysProject => {
-                lines.push(hint_line(if *project_trusted {
+                let base = if *project_trusted {
                     CONFIRM_ALLOW_PROJECT_HINTS
                 } else {
                     CONFIRM_ALLOW_PROJECT_SESSION_HINTS
-                }));
+                };
+                lines.push(confirm_hints(base, offers_shapes));
             }
             PromptState::ConfirmAllowAlwaysGlobal => {
-                lines.push(hint_line(CONFIRM_ALLOW_ALL_HINTS));
+                lines.push(confirm_hints(CONFIRM_ALLOW_ALL_HINTS, offers_shapes));
             }
             PromptState::ConfirmAllowSession => {
-                lines.push(hint_line(CONFIRM_SESSION_HINTS));
+                lines.push(confirm_hints(CONFIRM_SESSION_HINTS, offers_shapes));
             }
             PromptState::ConfirmDenyAlwaysProject => {
                 lines.push(hint_line(if *project_trusted {
@@ -485,6 +546,14 @@ mod tests {
     const MAIN_ID: &str = "id";
     const SUB_ID: &str = "id-2";
     const SUB_AGENT: &str = "sub-2";
+    const CD_SCOPE: &str = "cd /repo";
+    const URL_SCOPE: &str = "https://example.com";
+
+    fn open_with(tool: ToolKey, scope: &str) -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(MAIN_ID.into(), tool, vec![scope.into()], None, true);
+        prompt
+    }
 
     fn open_trusted(prompt: &mut PermissionPrompt, project_trusted: bool) {
         prompt.push(
@@ -512,9 +581,7 @@ mod tests {
     }
 
     fn open_prompt() -> PermissionPrompt {
-        let mut prompt = PermissionPrompt::new();
-        open_trusted(&mut prompt, true);
-        prompt
+        open_with(ToolKey::native("bash"), "execute")
     }
 
     fn rendered(prompt: &PermissionPrompt) -> String {
@@ -524,6 +591,31 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn state_of(prompt: &PermissionPrompt) -> PromptState {
+        assert!(prompt.is_open(), "expected an open prompt");
+        prompt.state
+    }
+
+    fn rules_of(answer: Option<PermissionAnswer>) -> Vec<String> {
+        match answer {
+            Some(
+                PermissionAnswer::AllowSession { rules }
+                | PermissionAnswer::AllowAlwaysProject { rules }
+                | PermissionAnswer::AllowAlwaysGlobal { rules },
+            ) => rules,
+            other => panic!("expected a rule-writing allow, got {other:?}"),
+        }
+    }
+
+    fn press(prompt: &mut PermissionPrompt, codes: &[KeyCode]) {
+        for code in codes {
+            assert!(
+                prompt.handle_key(key(*code)).is_none(),
+                "{code:?} answered early"
+            );
+        }
     }
 
     fn ctrl_c() -> KeyEvent {
@@ -590,6 +682,76 @@ mod tests {
         prompt.handle_key(key(KeyCode::Char('n')));
         assert!(prompt.handle_paste("accepted"));
         assert_eq!(prompt.buffer.value(), "accepted");
+    }
+
+    #[test_case('s' => matches Some(PermissionAnswer::AllowSession { .. }) ; "s_is_session")]
+    #[test_case('a' => matches Some(PermissionAnswer::AllowAlwaysProject { .. }) ; "a_is_project")]
+    #[test_case('A' => matches Some(PermissionAnswer::AllowAlwaysGlobal { .. }) ; "shift_a_is_global")]
+    fn confirm_key_picks_the_variant(open: char) -> Option<PermissionAnswer> {
+        let mut prompt = open_prompt();
+        press(&mut prompt, &[KeyCode::Char(open)]);
+        answer(&mut prompt, key(KeyCode::Enter))
+    }
+
+    /// The rules in the answer are the rules on screen: the default shape
+    /// writes what every approval wrote before, and each `Right` walks the
+    /// shapes the core offers for bash until it wraps.
+    #[test_case('s', 0 => vec!["cd *"] ; "default_is_wildcard")]
+    #[test_case('a', 1 => vec!["cd /repo"] ; "one_right_is_exact")]
+    #[test_case('A', 2 => vec!["cd /repo *"] ; "two_rights_is_path_scoped")]
+    #[test_case('s', 3 => vec!["cd *"] ; "three_rights_wrap")]
+    fn confirm_commits_the_displayed_rules(open: char, rights: usize) -> Vec<String> {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char(open)]);
+        press(&mut prompt, &vec![KeyCode::Right; rights]);
+        assert_ne!(state_of(&prompt), PromptState::Normal);
+        rules_of(answer(&mut prompt, key(KeyCode::Char('y'))))
+    }
+
+    #[test]
+    fn left_cycles_backwards() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char('s'), KeyCode::Left]);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd /repo *"]
+        );
+    }
+
+    #[test]
+    fn cancelled_confirm_forgets_the_shape() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(
+            &mut prompt,
+            &[KeyCode::Char('s'), KeyCode::Right, KeyCode::Esc],
+        );
+        assert_eq!(state_of(&prompt), PromptState::Normal);
+        press(&mut prompt, &[KeyCode::Char('a')]);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd *"]
+        );
+    }
+
+    #[test]
+    fn fixed_shape_tool_ignores_cycling() {
+        let mut prompt = open_with(ToolKey::native("webfetch"), URL_SCOPE);
+        press(
+            &mut prompt,
+            &[KeyCode::Char('s'), KeyCode::Right, KeyCode::Left],
+        );
+        assert_eq!(state_of(&prompt), PromptState::ConfirmAllowSession);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec![URL_SCOPE]
+        );
+    }
+
+    #[test]
+    fn deny_confirm_does_not_cycle() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char('d'), KeyCode::Right]);
+        assert_eq!(state_of(&prompt), PromptState::Normal);
     }
 
     #[test]
