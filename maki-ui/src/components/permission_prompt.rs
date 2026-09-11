@@ -82,6 +82,7 @@ const RULE_EDIT_HINTS: &[(&str, &str)] = &[
     ("Enter", "Accept rules"),
     ("Esc", "Revert"),
     ("↑/↓", "Rule"),
+    ("Tab", "Done — answer as usual"),
 ];
 const SHAPE_HINT: (&str, &str) = ("←/→", "Rule shape");
 const EDIT_HINT: (&str, &str) = ("e", "Edit rules");
@@ -133,6 +134,10 @@ fn caret_spans(text: &str, cursor: usize, style: Style) -> Vec<Span<'static>> {
 pub(crate) struct RuleEditor {
     rows: Vec<TextBuffer>,
     selected: usize,
+    /// Done state: the prompt's own answer keys pass through and typing goes
+    /// back to editing, so the editor is a second entrypoint to the same
+    /// answers rather than a detour.
+    locked: bool,
 }
 
 impl RuleEditor {
@@ -145,7 +150,11 @@ impl RuleEditor {
                 row
             })
             .collect();
-        Self { rows, selected: 0 }
+        Self {
+            rows,
+            selected: 0,
+            locked: false,
+        }
     }
 
     fn rules(&self) -> Vec<String> {
@@ -356,19 +365,57 @@ impl PermissionPrompt {
             return Some(PermissionAnswer::Deny);
         }
         if let Some(editor) = rule_editor.as_mut() {
-            let settled = match key.code {
-                KeyCode::Enter => Some(editor.rules()),
-                KeyCode::Esc => Some(proposed_rules(tool, scopes, *shape)),
-                _ => {
-                    editor.handle_key(key);
-                    None
+            if editor.locked {
+                match key.code {
+                    KeyCode::Tab => {
+                        editor.locked = false;
+                        return None;
+                    }
+                    KeyCode::Up | KeyCode::Down => {
+                        editor.handle_key(key);
+                        return None;
+                    }
+                    KeyCode::Esc => {
+                        *rules = proposed_rules(tool, scopes, *shape);
+                        *rule_editor = None;
+                        return None;
+                    }
+                    KeyCode::Enter => {
+                        *rules = editor.rules();
+                        *rule_editor = None;
+                        return None;
+                    }
+                    KeyCode::Char('y' | 'n' | 'a' | 'A' | 's' | 'd' | 'D') => {
+                        *rules = editor.rules();
+                        *rule_editor = None;
+                        // fall through: the prompt answers this key as if the
+                        // editor were never open
+                    }
+                    _ => {
+                        editor.locked = false;
+                        editor.handle_key(key);
+                        return None;
+                    }
                 }
-            };
-            if let Some(list) = settled {
-                *rules = list;
-                *rule_editor = None;
+            } else {
+                let settled = match key.code {
+                    KeyCode::Enter => Some(editor.rules()),
+                    KeyCode::Esc => Some(proposed_rules(tool, scopes, *shape)),
+                    KeyCode::Tab => {
+                        editor.locked = true;
+                        None
+                    }
+                    _ => {
+                        editor.handle_key(key);
+                        None
+                    }
+                };
+                if let Some(list) = settled {
+                    *rules = list;
+                    *rule_editor = None;
+                }
+                return None;
             }
-            return None;
         }
         if *state == PromptState::DenyEditing {
             return match key.code {
@@ -481,6 +528,7 @@ impl PermissionPrompt {
             .front_mut()
             .and_then(|request| request.rule_editor.as_mut());
         if let Some(editor) = editor {
+            editor.locked = false;
             editor.insert_text(text);
             return true;
         }
@@ -555,7 +603,7 @@ impl PermissionPrompt {
                 for (i, row) in editor.rows.iter().enumerate() {
                     let mut spans =
                         vec![Span::raw("  "), Span::styled(allow_label(i), label_style)];
-                    if i == editor.selected {
+                    if !editor.locked && i == editor.selected {
                         spans.extend(caret_spans(&row.value(), row.x(), value_style));
                     } else {
                         spans.push(Span::styled(row.value(), value_style));
@@ -614,8 +662,17 @@ impl PermissionPrompt {
         }
 
         lines.push(Line::raw(""));
-        if rule_editor.is_some() {
-            lines.push(hint_line(RULE_EDIT_HINTS));
+        if let Some(editor) = &rule_editor {
+            if editor.locked {
+                let rows = if *project_trusted {
+                    [HINT_ALLOW_ROW, HINT_DENY_ROW]
+                } else {
+                    [HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED]
+                };
+                lines.extend(aligned_hint_rows(&rows));
+            } else {
+                lines.push(hint_line(RULE_EDIT_HINTS));
+            }
             lines.push(Line::raw(""));
             return lines;
         }
@@ -771,6 +828,48 @@ mod tests {
         let mut prompt = open_prompt();
         press(&mut prompt, &[KeyCode::Char('e')]);
         assert!(editing(&prompt));
+    }
+
+    #[test]
+    fn done_editor_answers_with_the_prompt_keys() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(
+            &mut prompt,
+            &[KeyCode::Char('e'), KeyCode::Tab, KeyCode::Char('s')],
+        );
+        assert_eq!(state_of(&prompt), PromptState::ConfirmAllowSession);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd *"]
+        );
+    }
+
+    #[test]
+    fn y_from_a_done_editor_answers_allow_once() {
+        let mut prompt = open_prompt();
+        press(&mut prompt, &[KeyCode::Char('e'), KeyCode::Tab]);
+        assert_eq!(
+            answer(&mut prompt, key(KeyCode::Char('y'))),
+            Some(PermissionAnswer::AllowOnce)
+        );
+    }
+
+    #[test]
+    fn typing_from_a_done_editor_resumes_editing() {
+        let mut prompt = open_prompt();
+        press(
+            &mut prompt,
+            &[KeyCode::Char('e'), KeyCode::Tab, KeyCode::Char('x')],
+        );
+        let editor = prompt
+            .queue
+            .front()
+            .and_then(|request| request.rule_editor.as_ref());
+        assert!(
+            editor.is_some_and(|editor| !editor.locked),
+            "expected the editor to stay open"
+        );
+        assert!(rendered(&prompt).contains("execute *x"));
     }
 
     #[test]
