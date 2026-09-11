@@ -269,9 +269,15 @@ impl PermissionPrompt {
             return None;
         }
         let confirm_answer = match *state {
-            PromptState::ConfirmAllowAlwaysProject => Some(PermissionAnswer::AllowAlwaysProject),
-            PromptState::ConfirmAllowAlwaysGlobal => Some(PermissionAnswer::AllowAlwaysGlobal),
-            PromptState::ConfirmAllowSession => Some(PermissionAnswer::AllowSession),
+            PromptState::ConfirmAllowAlwaysProject => {
+                Some(PermissionAnswer::AllowAlwaysProject { rules: vec![] })
+            }
+            PromptState::ConfirmAllowAlwaysGlobal => {
+                Some(PermissionAnswer::AllowAlwaysGlobal { rules: vec![] })
+            }
+            PromptState::ConfirmAllowSession => {
+                Some(PermissionAnswer::AllowSession { rules: vec![] })
+            }
             PromptState::ConfirmDenyAlwaysProject => Some(PermissionAnswer::DenyAlwaysProject),
             PromptState::ConfirmDenyAlwaysGlobal => Some(PermissionAnswer::DenyAlwaysGlobal),
             _ => None,

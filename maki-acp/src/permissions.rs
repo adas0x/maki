@@ -57,7 +57,7 @@ pub fn outcome_to_answer(outcome: &RequestPermissionOutcome) -> PermissionAnswer
         RequestPermissionOutcome::Cancelled => PermissionAnswer::Deny,
         RequestPermissionOutcome::Selected(selected) => match selected.option_id.0.as_ref() {
             ALLOW_ONCE_ID => PermissionAnswer::AllowOnce,
-            ALLOW_ALWAYS_ID => PermissionAnswer::AllowSession,
+            ALLOW_ALWAYS_ID => PermissionAnswer::AllowSession { rules: vec![] },
             REJECT_ONCE_ID => PermissionAnswer::Deny,
             REJECT_ALWAYS_ID => PermissionAnswer::DenyAlwaysProject,
             _ => PermissionAnswer::Deny,
@@ -80,7 +80,7 @@ mod tests {
     /// An ACP client cannot be told about folder trust, so the always-answers
     /// must not reach further than the ones the TUI offers.
     #[test_case(ALLOW_ONCE_ID, PermissionAnswer::AllowOnce ; "allow_once")]
-    #[test_case(ALLOW_ALWAYS_ID, PermissionAnswer::AllowSession ; "allow_always_lasts_for_the_session")]
+    #[test_case(ALLOW_ALWAYS_ID, PermissionAnswer::AllowSession { rules: vec![] } ; "allow_always_lasts_for_the_session")]
     #[test_case(REJECT_ONCE_ID, PermissionAnswer::Deny ; "reject_once")]
     #[test_case(REJECT_ALWAYS_ID, PermissionAnswer::DenyAlwaysProject ; "reject_always_follows_folder_trust")]
     fn every_offered_option_maps_to_an_answer(id: &str, expected: PermissionAnswer) {
