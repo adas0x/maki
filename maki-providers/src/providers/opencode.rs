@@ -149,7 +149,7 @@ pub struct Opencode {
 impl Opencode {
     pub fn new(timeouts: Timeouts) -> Self {
         Self {
-            transport: CatalogTransport::new(timeouts),
+            transport: CatalogTransport::new(timeouts, GO_SLUG),
             auth: None,
             system_prefix: None,
         }

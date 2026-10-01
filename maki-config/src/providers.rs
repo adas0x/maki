@@ -287,6 +287,14 @@ pub struct ProviderDef {
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// Sampling temperature sent as `temperature` in the request body.
+    /// Unset sends nothing so the provider's own default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Nucleus sampling threshold sent as `top_p` in the request body,
+    /// must be in `(0, 1]`. Unset sends nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
     /// Extra HTTP headers sent with every request to this provider. Values
@@ -617,6 +625,24 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
     builtin_provider(slug).and_then(|b| b.login_url.map(|u| u.to_string()))
 }
 
+pub fn resolve_temperature(def: Option<&ProviderDef>) -> Option<f64> {
+    def.and_then(|d| d.temperature)
+        .filter(|t| t.is_finite() && *t >= 0.0)
+}
+
+pub fn resolve_top_p(def: Option<&ProviderDef>) -> Option<f64> {
+    def.and_then(|d| d.top_p)
+        .filter(|p| p.is_finite() && *p > 0.0 && *p <= 1.0)
+}
+
+pub fn temperature_for(slug: &str) -> Option<f64> {
+    resolve_temperature(ProvidersConfig::load_or_default().get(slug))
+}
+
+pub fn top_p_for(slug: &str) -> Option<f64> {
+    resolve_top_p(ProvidersConfig::load_or_default().get(slug))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +662,30 @@ mod tests {
     fn provider_def_without_headers_is_empty() {
         let def: ProviderDef = toml::from_str("base_url = \"https://x\"\n").unwrap();
         assert!(def.headers.is_empty());
+    }
+
+    #[test_case(1.0,  Some(1.0) ; "unit")]
+    #[test_case(0.7,  Some(0.7) ; "fraction")]
+    #[test_case(0.0,  Some(0.0) ; "zero_still_valid_for_temperature")]
+    #[test_case(-0.1, None      ; "negative_rejected")]
+    fn resolve_temperature_bounds(value: f64, expected: Option<f64>) {
+        let def = ProviderDef {
+            temperature: Some(value),
+            ..ProviderDef::default()
+        };
+        assert_eq!(resolve_temperature(Some(&def)), expected);
+    }
+
+    #[test_case(0.95, Some(0.95) ; "fraction")]
+    #[test_case(1.0,  Some(1.0)  ; "upper_bound_inclusive")]
+    #[test_case(0.0,  None       ; "zero_rejected")]
+    #[test_case(1.2,  None       ; "above_one_rejected")]
+    fn resolve_top_p_bounds(value: f64, expected: Option<f64>) {
+        let def = ProviderDef {
+            top_p: Some(value),
+            ..ProviderDef::default()
+        };
+        assert_eq!(resolve_top_p(Some(&def)), expected);
     }
 
     #[test]

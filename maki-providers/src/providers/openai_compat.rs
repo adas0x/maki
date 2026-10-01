@@ -74,6 +74,8 @@ pub(crate) struct OpenAiCompatProvider {
     /// bare ollama host). Request-time `auth.base_url` still wins (custom,
     /// local, dynamic).
     resolved_base_url: Option<String>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
 }
 
 impl OpenAiCompatProvider {
@@ -82,18 +84,33 @@ impl OpenAiCompatProvider {
         timeouts: super::Timeouts,
     ) -> Self {
         let config = config.into();
-        let resolved_base_url = if config.slug.is_empty() {
-            None
+        let (resolved_base_url, temperature, top_p) = if config.slug.is_empty() {
+            (None, None, None)
         } else {
             let providers = maki_config::providers::ProvidersConfig::load();
-            maki_config::providers::configured_base_url(&config.slug, providers.get(&config.slug))
+            let def = providers.get(&config.slug);
+            (
+                maki_config::providers::configured_base_url(&config.slug, def),
+                maki_config::providers::resolve_temperature(def),
+                maki_config::providers::resolve_top_p(def),
+            )
         };
         Self {
             client: super::http_client(timeouts),
             config,
             stream_timeout: timeouts.stream,
             resolved_base_url,
+            temperature,
+            top_p,
         }
+    }
+
+    /// Explicit per-slug sampling for paths whose static config slug is not the
+    /// routed provider slug (catalog sub-providers, the gateway).
+    pub(crate) fn with_sampling(mut self, temperature: Option<f64>, top_p: Option<f64>) -> Self {
+        self.temperature = temperature;
+        self.top_p = top_p;
+        self
     }
 
     pub(crate) fn client(&self) -> &HttpClient {
@@ -167,6 +184,14 @@ impl OpenAiCompatProvider {
             "messages": wire_messages,
             "stream": true,
         });
+        // Sent unconditionally: OpenAI-compatible endpoints accept sampling
+        // params with thinking on, unlike the native Anthropic/OpenAI paths.
+        if let Some(temperature) = self.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = self.top_p {
+            body["top_p"] = json!(top_p);
+        }
         if let Some(max_output) = model.output_tokens() {
             body[&*self.config.max_tokens_field] = json!(max_output);
         }
@@ -808,6 +833,64 @@ pub async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::model::{Model, ModelFamily, ModelPricing, ModelTier};
+
+    static SAMPLING_CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+        slug: Cow::Borrowed(""),
+        api_key_env: Cow::Borrowed(""),
+        base_url: Cow::Borrowed(""),
+        max_tokens_field: Cow::Borrowed("max_tokens"),
+        include_stream_usage: false,
+        provider_name: Cow::Borrowed("test"),
+    };
+
+    fn test_timeouts() -> super::super::Timeouts {
+        super::super::Timeouts {
+            connect: Duration::from_secs(5),
+            ..Default::default()
+        }
+    }
+
+    fn test_model() -> Model {
+        Model {
+            id: "m".into(),
+            provider: Arc::<str>::from("test"),
+            tier: ModelTier::Medium,
+            family: ModelFamily::Gemini,
+            supports_vision_override: None,
+            supports_fast_override: None,
+            supports_tool_examples_override: None,
+            thinking_override: None,
+            pricing: ModelPricing::default(),
+            subsidised_by: None,
+            discovered_free: false,
+            max_output_tokens: Some(8192),
+            turn_output_tokens: None,
+            context_window: 128_000,
+            thinking_fields: None,
+        }
+    }
+
+    #[test]
+    fn build_body_sends_sampling_params_when_set() {
+        let compat = OpenAiCompatProvider::new(&SAMPLING_CONFIG, test_timeouts())
+            .with_sampling(Some(1.0), Some(0.95));
+        let body = compat.build_body(&test_model(), &[], "", &json!([]));
+        assert_eq!(body["temperature"], json!(1.0));
+        assert_eq!(body["top_p"], json!(0.95));
+    }
+
+    #[test]
+    fn build_body_omits_sampling_params_when_unset() {
+        let compat = OpenAiCompatProvider::new(&SAMPLING_CONFIG, test_timeouts());
+        let body = compat.build_body(&test_model(), &[], "", &json!([]));
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+    }
     use futures_lite::io::Cursor;
     use test_case::test_case;
 
