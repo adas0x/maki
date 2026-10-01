@@ -1706,6 +1706,7 @@ impl App {
             tool,
             scopes,
             reason,
+            context,
         } = result
         {
             let project_trusted = self.permissions.project_is_trusted();
@@ -1713,6 +1714,7 @@ impl App {
                 id,
                 tool,
                 scopes,
+                context,
                 subagent_id.clone(),
                 project_trusted,
                 reason,
