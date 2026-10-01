@@ -298,19 +298,19 @@ maki.api.register_tool({
 
     local parser = maki.treesitter.get_parser(command, "bash")
     if not parser then
-      return { scopes = { command }, force_prompt = true }
+      return { scopes = { command }, force_prompt = true, context = command }
     end
 
     local root = parser:parse()[1]:root()
     if root:has_error() or is_complex(root) then
-      return { scopes = { command }, force_prompt = true }
+      return { scopes = { command }, force_prompt = true, context = command }
     end
 
     local segments = collect_commands(root, command)
     if #segments == 0 then
       segments = { command }
     end
-    return { scopes = segments, force_prompt = false }
+    return { scopes = segments, force_prompt = false, context = command }
   end,
 
   header = function(input)

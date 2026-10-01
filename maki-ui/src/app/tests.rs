@@ -2822,6 +2822,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        None,
         true,
         None,
     );
@@ -4173,6 +4174,7 @@ fn concurrent_subagent_permission_requests_are_each_answered() {
                 tool: ToolKey::native("bash"),
                 scopes: vec!["ls".into()],
                 reason: None,
+                context: None,
             },
             subagent: Some(subagent_info_with_tx(parent, RESEARCH_NAME, Some(tx))),
             run_id: 1,
@@ -5556,6 +5558,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        None,
         true,
         None,
     );
@@ -6242,6 +6245,7 @@ fn ctrl_c_denies_permission_prompt() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        None,
         true,
         None,
     );
@@ -6461,6 +6465,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         "perm-1".into(),
         maki_config::ToolKey::native("bash"),
         vec!["ls".into()],
+        None,
         None,
         true,
         None,
@@ -6817,6 +6822,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         maki_config::ToolKey::native("bash"),
         vec!["execute".into()],
         None,
+        None,
         true,
         None,
     );
@@ -6832,6 +6838,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         "id".into(),
         maki_config::ToolKey::Wildcard,
         vec![],
+        None,
         None,
         true,
         None,

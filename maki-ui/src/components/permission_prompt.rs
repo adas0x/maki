@@ -7,7 +7,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
+use maki_agent::permissions::{
+    DEFAULT_DENY_GUIDANCE, PermissionAnswer, RuleShape, proposed_rules, rule_shapes, scope_matches,
+};
 use maki_config::ToolKey;
 
 use crate::components::Overlay;
@@ -76,6 +78,113 @@ const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
 
 const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
 const QUEUED_NOTICE: &str = "more request(s) waiting";
+const RULE_EDIT_HINTS: &[(&str, &str)] = &[
+    ("Enter", "Accept rules"),
+    ("Esc", "Revert"),
+    ("↑/↓", "Rule"),
+    ("Tab", "Done — answer as usual"),
+];
+const SHAPE_HINT: (&str, &str) = ("←/→", "Rule shape");
+const EDIT_HINT: (&str, &str) = ("e", "Edit rules");
+const EDIT_CUE: &str = " (e edits)";
+const CUSTOM_SHAPE_LABEL: &str = "custom";
+const MATCH_MARK: &str = "✓ ";
+const MISS_MARK: &str = "✗ ";
+
+fn shape_label(shape: RuleShape) -> &'static str {
+    match shape {
+        RuleShape::Exact => "exact",
+        RuleShape::Wildcard => "wildcard",
+        RuleShape::PathScoped => "path-scoped",
+    }
+}
+
+fn cycled_shape(tool: &ToolKey, current: RuleShape, forward: bool) -> RuleShape {
+    let shapes = rule_shapes(tool);
+    let index = shapes.iter().position(|s| *s == current).unwrap_or(0);
+    let step = if forward { 1 } else { shapes.len() - 1 };
+    shapes[(index + step) % shapes.len()]
+}
+
+fn confirm_hints(base: &[(&str, &str)], offers_shapes: bool) -> Line<'static> {
+    let mut hints = base.to_vec();
+    if offers_shapes {
+        hints.push(SHAPE_HINT);
+    }
+    hints.push(EDIT_HINT);
+    hint_line(&hints)
+}
+
+fn caret_spans(text: &str, cursor: usize, style: Style) -> Vec<Span<'static>> {
+    let (before, after) = text.split_at(TextBuffer::char_to_byte(text, cursor));
+    let mut chars = after.chars();
+    let cursor_ch = chars.next().unwrap_or(' ');
+    let rest: String = chars.collect();
+    let mut spans = Vec::with_capacity(3);
+    if !before.is_empty() {
+        spans.push(Span::styled(before.to_string(), style));
+    }
+    spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest, style));
+    }
+    spans
+}
+
+pub(crate) struct RuleEditor {
+    rows: Vec<TextBuffer>,
+    selected: usize,
+    /// Done state: the prompt's own answer keys pass through and typing goes
+    /// back to editing, so the editor is a second entrypoint to the same
+    /// answers rather than a detour.
+    locked: bool,
+}
+
+impl RuleEditor {
+    fn over(rules: &[String]) -> Self {
+        let rows = rules
+            .iter()
+            .map(|rule| {
+                let mut row = TextBuffer::new(rule.clone());
+                row.move_to_end();
+                row
+            })
+            .collect();
+        Self {
+            rows,
+            selected: 0,
+            locked: false,
+        }
+    }
+
+    fn rules(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .map(|row| row.value().trim().to_string())
+            .filter(|rule| !rule.is_empty())
+            .collect()
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down => {
+                self.selected = (self.selected + 1).min(self.rows.len().saturating_sub(1));
+            }
+            _ => {
+                if let Some(row) = self.rows.get_mut(self.selected) {
+                    row.handle_key(key);
+                }
+            }
+        }
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        if let Some(row) = self.rows.get_mut(self.selected) {
+            row.insert_text(text);
+        }
+    }
+}
 
 fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
     let t = theme::current();
@@ -120,16 +229,30 @@ pub(crate) enum PromptState {
     DenyEditing,
 }
 
+impl PromptState {
+    fn confirms_allow_rules(self) -> bool {
+        matches!(
+            self,
+            Self::ConfirmAllowAlwaysProject
+                | Self::ConfirmAllowAlwaysGlobal
+                | Self::ConfirmAllowSession
+        )
+    }
+}
+
 struct Request {
     id: String,
     tool: ToolKey,
     scopes: Vec<String>,
+    context: Option<String>,
     subagent_id: Option<String>,
-    allow_scopes: Vec<String>,
     project_trusted: bool,
     /// Set when a plugin escalated the call, so the user sees why they are
     /// asked about a call their rules might have let through.
     reason: Option<String>,
+    shape: RuleShape,
+    rules: Vec<String>,
+    rule_editor: Option<Box<RuleEditor>>,
 }
 
 /// An answer carries the ask it settles: the agent only accepts one naming the
@@ -182,24 +305,24 @@ impl PermissionPrompt {
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
+        context: Option<String>,
         subagent_id: Option<String>,
         project_trusted: bool,
         reason: Option<String>,
     ) {
-        let allow_scopes = generalized_scopes(&tool, &scopes);
-        let allow_scopes = if allow_scopes == scopes {
-            vec![]
-        } else {
-            allow_scopes
-        };
+        let shape = RuleShape::default();
+        let rules = proposed_rules(&tool, &scopes, shape);
         self.queue.push_back(Request {
             id,
             tool,
             scopes,
+            context,
             subagent_id,
-            allow_scopes,
             project_trusted,
             reason,
+            shape,
+            rules,
+            rule_editor: None,
         });
     }
 
@@ -237,9 +360,70 @@ impl PermissionPrompt {
         if !self.is_open() {
             return None;
         }
+        let Request {
+            tool,
+            scopes,
+            shape,
+            rules,
+            rule_editor,
+            ..
+        } = self.queue.front_mut()?;
         let (state, buffer) = (&mut self.state, &mut self.buffer);
         if is_ctrl(&key) && key.code == KeyCode::Char('c') {
             return Some(PermissionAnswer::Deny);
+        }
+        if let Some(editor) = rule_editor.as_mut() {
+            if editor.locked {
+                match key.code {
+                    KeyCode::Tab => {
+                        editor.locked = false;
+                        return None;
+                    }
+                    KeyCode::Up | KeyCode::Down => {
+                        editor.handle_key(key);
+                        return None;
+                    }
+                    KeyCode::Esc => {
+                        *rules = proposed_rules(tool, scopes, *shape);
+                        *rule_editor = None;
+                        return None;
+                    }
+                    KeyCode::Enter => {
+                        *rules = editor.rules();
+                        *rule_editor = None;
+                        return None;
+                    }
+                    KeyCode::Char('y' | 'n' | 'a' | 'A' | 's' | 'd' | 'D') => {
+                        *rules = editor.rules();
+                        *rule_editor = None;
+                        // fall through: the prompt answers this key as if the
+                        // editor were never open
+                    }
+                    _ => {
+                        editor.locked = false;
+                        editor.handle_key(key);
+                        return None;
+                    }
+                }
+            } else {
+                let settled = match key.code {
+                    KeyCode::Enter => Some(editor.rules()),
+                    KeyCode::Esc => Some(proposed_rules(tool, scopes, *shape)),
+                    KeyCode::Tab => {
+                        editor.locked = true;
+                        None
+                    }
+                    _ => {
+                        editor.handle_key(key);
+                        None
+                    }
+                };
+                if let Some(list) = settled {
+                    *rules = list;
+                    *rule_editor = None;
+                }
+                return None;
+            }
         }
         if *state == PromptState::DenyEditing {
             return match key.code {
@@ -268,10 +452,31 @@ impl PermissionPrompt {
         {
             return None;
         }
+        let offers_shapes = rule_shapes(tool).len() > 1;
+        if state.confirms_allow_rules() || *state == PromptState::Normal {
+            match key.code {
+                KeyCode::Right | KeyCode::Left => {
+                    *shape = cycled_shape(tool, *shape, key.code == KeyCode::Right);
+                    *rules = proposed_rules(tool, scopes, *shape);
+                    return None;
+                }
+                KeyCode::Char('e') if offers_shapes => {
+                    *rule_editor = Some(Box::new(RuleEditor::over(rules)));
+                    return None;
+                }
+                _ => {}
+            }
+        }
         let confirm_answer = match *state {
-            PromptState::ConfirmAllowAlwaysProject => Some(PermissionAnswer::AllowAlwaysProject),
-            PromptState::ConfirmAllowAlwaysGlobal => Some(PermissionAnswer::AllowAlwaysGlobal),
-            PromptState::ConfirmAllowSession => Some(PermissionAnswer::AllowSession),
+            PromptState::ConfirmAllowAlwaysProject => Some(PermissionAnswer::AllowAlwaysProject {
+                rules: rules.clone(),
+            }),
+            PromptState::ConfirmAllowAlwaysGlobal => Some(PermissionAnswer::AllowAlwaysGlobal {
+                rules: rules.clone(),
+            }),
+            PromptState::ConfirmAllowSession => Some(PermissionAnswer::AllowSession {
+                rules: rules.clone(),
+            }),
             PromptState::ConfirmDenyAlwaysProject => Some(PermissionAnswer::DenyAlwaysProject),
             PromptState::ConfirmDenyAlwaysGlobal => Some(PermissionAnswer::DenyAlwaysGlobal),
             _ => None,
@@ -280,7 +485,14 @@ impl PermissionPrompt {
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => Some(answer),
                 _ => {
+                    let hand_edited = rule_shapes(tool)
+                        .iter()
+                        .all(|s| proposed_rules(tool, scopes, *s) != *rules);
                     *state = PromptState::Normal;
+                    *shape = RuleShape::default();
+                    if !hand_edited {
+                        *rules = proposed_rules(tool, scopes, *shape);
+                    }
                     None
                 }
             };
@@ -316,7 +528,19 @@ impl PermissionPrompt {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        if !self.is_open() || self.state != PromptState::DenyEditing {
+        if !self.is_open() {
+            return false;
+        }
+        let editor = self
+            .queue
+            .front_mut()
+            .and_then(|request| request.rule_editor.as_mut());
+        if let Some(editor) = editor {
+            editor.locked = false;
+            editor.insert_text(text);
+            return true;
+        }
+        if self.state != PromptState::DenyEditing {
             return false;
         }
         self.buffer.insert_text(text);
@@ -327,16 +551,26 @@ impl PermissionPrompt {
         let Some(Request {
             tool,
             scopes,
+            context,
             subagent_id,
-            allow_scopes,
             project_trusted,
             reason,
+            shape,
+            rules,
+            rule_editor,
             ..
         }) = self.queue.front()
         else {
             return vec![];
         };
         let (state, buffer) = (&self.state, &self.buffer);
+        let picking_shape = state.confirms_allow_rules();
+        let previewing = picking_shape || rule_editor.is_some();
+        let offers_shapes = rule_shapes(tool).len() > 1;
+        let live_rules = match rule_editor {
+            Some(editor) => editor.rules(),
+            None => rules.clone(),
+        };
         let t = theme::current();
         let label_style = t.tool_dim;
         let value_style = Style::new().fg(t.foreground);
@@ -363,48 +597,81 @@ impl PermissionPrompt {
                 Span::styled(format!("{waiting} {QUEUED_NOTICE}"), t.item_desc),
             ]));
         }
-        for (i, s) in scopes.iter().enumerate() {
-            let label = if i == 0 { "scope " } else { "    + " };
+        if let Some(cmd) = context.as_ref().filter(|c| !scopes.contains(c)) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(label, label_style),
-                Span::styled(s.clone(), value_style),
+                Span::styled("cmd   ", label_style),
+                Span::styled(cmd.clone(), value_style),
             ]));
         }
-
-        if !allow_scopes.is_empty() {
-            for (i, g) in allow_scopes.iter().enumerate() {
-                let label = if i == 0 { "allow " } else { "    + " };
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(label, label_style),
-                    Span::styled(g.clone(), value_style),
-                ]));
+        for (i, s) in scopes.iter().enumerate() {
+            let label = if i == 0 { "scope " } else { "    + " };
+            let mut spans = vec![Span::raw("  "), Span::styled(label, label_style)];
+            if previewing {
+                let (mark, style) = if live_rules.iter().any(|rule| scope_matches(rule, s)) {
+                    (MATCH_MARK, t.tool_success)
+                } else {
+                    (MISS_MARK, t.tool_error)
+                };
+                spans.push(Span::styled(mark, style));
+                spans.push(Span::styled(s.clone(), style));
+            } else {
+                spans.push(Span::styled(s.clone(), value_style));
             }
+            lines.push(Line::from(spans));
+        }
+
+        let allow_label = |i: usize| if i == 0 { "allow " } else { "    + " };
+        match rule_editor {
+            Some(editor) => {
+                for (i, row) in editor.rows.iter().enumerate() {
+                    let mut spans =
+                        vec![Span::raw("  "), Span::styled(allow_label(i), label_style)];
+                    if !editor.locked && i == editor.selected {
+                        spans.extend(caret_spans(&row.value(), row.x(), value_style));
+                    } else {
+                        spans.push(Span::styled(row.value(), value_style));
+                    }
+                    lines.push(Line::from(spans));
+                }
+            }
+            None if picking_shape || *rules != *scopes => {
+                let cue = *state == PromptState::Normal && offers_shapes;
+                let last = rules.len().saturating_sub(1);
+                for (i, rule) in rules.iter().enumerate() {
+                    let mut spans = vec![
+                        Span::raw("  "),
+                        Span::styled(allow_label(i), label_style),
+                        Span::styled(rule.clone(), value_style),
+                    ];
+                    if cue && i == last {
+                        spans.push(Span::styled(EDIT_CUE, t.tool_dim));
+                    }
+                    lines.push(Line::from(spans));
+                }
+            }
+            None => {}
+        }
+        if picking_shape && offers_shapes && rule_editor.is_none() {
+            let label = if *rules == proposed_rules(tool, scopes, *shape) {
+                shape_label(*shape)
+            } else {
+                CUSTOM_SHAPE_LABEL
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("shape ", label_style),
+                Span::styled(label, value_style),
+            ]));
         }
 
         if *state == PromptState::DenyEditing {
             let text = buffer.value();
-            let (display_text, cursor_pos) = if text.is_empty() {
-                (DEFAULT_DENY_GUIDANCE, 0)
-            } else {
-                (text.as_str(), TextBuffer::char_to_byte(&text, buffer.x()))
-            };
-            let (before, after) = display_text.split_at(cursor_pos);
-            let mut chars = after.chars();
-            let cursor_ch = chars.next().unwrap_or(' ');
-            let rest: String = chars.collect();
-
             let mut spans = vec![Span::raw("  "), Span::styled("guide ", label_style)];
             if text.is_empty() {
-                spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
-                spans.push(Span::styled(rest, t.tool_dim));
+                spans.extend(caret_spans(DEFAULT_DENY_GUIDANCE, 0, t.tool_dim));
             } else {
-                spans.push(Span::raw(before.to_string()));
-                spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
-                if !rest.is_empty() {
-                    spans.push(Span::raw(rest));
-                }
+                spans.extend(caret_spans(&text, buffer.x(), Style::new()));
             }
             lines.push(Line::from(spans));
         }
@@ -419,19 +686,34 @@ impl PermissionPrompt {
         }
 
         lines.push(Line::raw(""));
+        if let Some(editor) = &rule_editor {
+            if editor.locked {
+                let rows = if *project_trusted {
+                    [HINT_ALLOW_ROW, HINT_DENY_ROW]
+                } else {
+                    [HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED]
+                };
+                lines.extend(aligned_hint_rows(&rows));
+            } else {
+                lines.push(hint_line(RULE_EDIT_HINTS));
+            }
+            lines.push(Line::raw(""));
+            return lines;
+        }
         match *state {
             PromptState::ConfirmAllowAlwaysProject => {
-                lines.push(hint_line(if *project_trusted {
+                let base = if *project_trusted {
                     CONFIRM_ALLOW_PROJECT_HINTS
                 } else {
                     CONFIRM_ALLOW_PROJECT_SESSION_HINTS
-                }));
+                };
+                lines.push(confirm_hints(base, offers_shapes));
             }
             PromptState::ConfirmAllowAlwaysGlobal => {
-                lines.push(hint_line(CONFIRM_ALLOW_ALL_HINTS));
+                lines.push(confirm_hints(CONFIRM_ALLOW_ALL_HINTS, offers_shapes));
             }
             PromptState::ConfirmAllowSession => {
-                lines.push(hint_line(CONFIRM_SESSION_HINTS));
+                lines.push(confirm_hints(CONFIRM_SESSION_HINTS, offers_shapes));
             }
             PromptState::ConfirmDenyAlwaysProject => {
                 lines.push(hint_line(if *project_trusted {
@@ -447,12 +729,12 @@ impl PermissionPrompt {
                 lines.push(hint_line(DENY_GUIDANCE_HINTS));
             }
             PromptState::Normal => {
-                let rows: &[&[(&str, &str)]] = if *project_trusted {
-                    &[HINT_ALLOW_ROW, HINT_DENY_ROW]
+                let rows = if *project_trusted {
+                    [HINT_ALLOW_ROW, HINT_DENY_ROW]
                 } else {
-                    &[HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED]
+                    [HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED]
                 };
-                lines.extend(aligned_hint_rows(rows));
+                lines.extend(aligned_hint_rows(&rows));
             }
         }
         lines.push(Line::raw(""));
@@ -485,19 +767,29 @@ mod tests {
 
     use super::{
         CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
-        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, Overlay, PermissionPrompt,
-        PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
+        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, EDIT_CUE, MATCH_MARK,
+        MISS_MARK, Overlay, PermissionPrompt, PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER,
+        UNTRUSTED_NOTICE,
     };
 
     const MAIN_ID: &str = "id";
     const SUB_ID: &str = "id-2";
     const SUB_AGENT: &str = "sub-2";
+    const CD_SCOPE: &str = "cd /repo";
+    const URL_SCOPE: &str = "https://example.com";
+
+    fn open_with(tool: ToolKey, scope: &str) -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(MAIN_ID.into(), tool, vec![scope.into()], None, None, true, None);
+        prompt
+    }
 
     fn open_trusted(prompt: &mut PermissionPrompt, project_trusted: bool) {
         prompt.push(
             MAIN_ID.into(),
             ToolKey::native("bash"),
             vec!["execute".into()],
+            None,
             None,
             project_trusted,
             None,
@@ -509,6 +801,7 @@ mod tests {
             SUB_ID.into(),
             ToolKey::native("read"),
             vec!["/tmp/x".into()],
+            None,
             Some(SUB_AGENT.into()),
             true,
             None,
@@ -521,9 +814,7 @@ mod tests {
     }
 
     fn open_prompt() -> PermissionPrompt {
-        let mut prompt = PermissionPrompt::new();
-        open_trusted(&mut prompt, true);
-        prompt
+        open_with(ToolKey::native("bash"), "execute")
     }
 
     fn rendered(prompt: &PermissionPrompt) -> String {
@@ -533,6 +824,110 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn state_of(prompt: &PermissionPrompt) -> PromptState {
+        assert!(prompt.is_open(), "expected an open prompt");
+        prompt.state
+    }
+
+    fn rules_of(answer: Option<PermissionAnswer>) -> Vec<String> {
+        match answer {
+            Some(
+                PermissionAnswer::AllowSession { rules }
+                | PermissionAnswer::AllowAlwaysProject { rules }
+                | PermissionAnswer::AllowAlwaysGlobal { rules },
+            ) => rules,
+            other => panic!("expected a rule-writing allow, got {other:?}"),
+        }
+    }
+
+    fn press(prompt: &mut PermissionPrompt, codes: &[KeyCode]) {
+        for code in codes {
+            assert!(
+                prompt.handle_key(key(*code)).is_none(),
+                "{code:?} answered early"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_opens_from_the_initial_prompt() {
+        let mut prompt = open_prompt();
+        press(&mut prompt, &[KeyCode::Char('e')]);
+        assert!(editing(&prompt));
+    }
+
+    #[test]
+    fn done_editor_answers_with_the_prompt_keys() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(
+            &mut prompt,
+            &[KeyCode::Char('e'), KeyCode::Tab, KeyCode::Char('s')],
+        );
+        assert_eq!(state_of(&prompt), PromptState::ConfirmAllowSession);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd *"]
+        );
+    }
+
+    #[test]
+    fn y_from_a_done_editor_answers_allow_once() {
+        let mut prompt = open_prompt();
+        press(&mut prompt, &[KeyCode::Char('e'), KeyCode::Tab]);
+        assert_eq!(
+            answer(&mut prompt, key(KeyCode::Char('y'))),
+            Some(PermissionAnswer::AllowOnce)
+        );
+    }
+
+    #[test]
+    fn typing_from_a_done_editor_resumes_editing() {
+        let mut prompt = open_prompt();
+        press(
+            &mut prompt,
+            &[KeyCode::Char('e'), KeyCode::Tab, KeyCode::Char('x')],
+        );
+        let editor = prompt
+            .queue
+            .front()
+            .and_then(|request| request.rule_editor.as_ref());
+        assert!(
+            editor.is_some_and(|editor| !editor.locked),
+            "expected the editor to stay open"
+        );
+        assert!(rendered(&prompt).contains("execute *x"));
+    }
+
+    #[test]
+    fn initial_prompt_cues_editing_for_shape_tools_only() {
+        assert!(rendered(&open_prompt()).contains(EDIT_CUE));
+        let mcp = open_with(ToolKey::parse("srv.tool").unwrap(), URL_SCOPE);
+        assert!(!rendered(&mcp).contains(EDIT_CUE));
+    }
+
+    #[test]
+    fn edited_rules_survive_a_cancelled_confirm() {
+        let mut prompt = open_prompt();
+        press(
+            &mut prompt,
+            &[KeyCode::Char('e'), KeyCode::Char('X'), KeyCode::Enter],
+        );
+        press(&mut prompt, &[KeyCode::Char('s'), KeyCode::Char('q')]);
+        assert_eq!(state_of(&prompt), PromptState::Normal);
+        assert!(rendered(&prompt).contains("execute *X"));
+    }
+
+    #[test]
+    fn shape_cycled_rules_reset_on_cancelled_confirm() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(
+            &mut prompt,
+            &[KeyCode::Right, KeyCode::Char('s'), KeyCode::Char('q')],
+        );
+        assert_eq!(state_of(&prompt), PromptState::Normal);
+        assert!(rendered(&prompt).contains("cd *"));
     }
 
     fn ctrl_c() -> KeyEvent {
@@ -601,10 +996,80 @@ mod tests {
         assert_eq!(prompt.buffer.value(), "accepted");
     }
 
+    #[test_case('s' => matches Some(PermissionAnswer::AllowSession { .. }) ; "s_is_session")]
+    #[test_case('a' => matches Some(PermissionAnswer::AllowAlwaysProject { .. }) ; "a_is_project")]
+    #[test_case('A' => matches Some(PermissionAnswer::AllowAlwaysGlobal { .. }) ; "shift_a_is_global")]
+    fn confirm_key_picks_the_variant(open: char) -> Option<PermissionAnswer> {
+        let mut prompt = open_prompt();
+        press(&mut prompt, &[KeyCode::Char(open)]);
+        answer(&mut prompt, key(KeyCode::Enter))
+    }
+
+    /// The rules in the answer are the rules on screen: the default shape
+    /// writes what every approval wrote before, and each `Right` walks the
+    /// shapes the core offers for bash until it wraps.
+    #[test_case('s', 0 => vec!["cd *"] ; "default_is_wildcard")]
+    #[test_case('a', 1 => vec!["cd /repo"] ; "one_right_is_exact")]
+    #[test_case('A', 2 => vec!["cd /repo", "cd /repo/*"] ; "two_rights_is_path_scoped")]
+    #[test_case('s', 3 => vec!["cd *"] ; "three_rights_wrap")]
+    fn confirm_commits_the_displayed_rules(open: char, rights: usize) -> Vec<String> {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char(open)]);
+        press(&mut prompt, &vec![KeyCode::Right; rights]);
+        assert_ne!(state_of(&prompt), PromptState::Normal);
+        rules_of(answer(&mut prompt, key(KeyCode::Char('y'))))
+    }
+
+    #[test]
+    fn left_cycles_backwards() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char('s'), KeyCode::Left]);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd /repo", "cd /repo/*"]
+        );
+    }
+
+    #[test]
+    fn cancelled_confirm_forgets_the_shape() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(
+            &mut prompt,
+            &[KeyCode::Char('s'), KeyCode::Right, KeyCode::Esc],
+        );
+        assert_eq!(state_of(&prompt), PromptState::Normal);
+        press(&mut prompt, &[KeyCode::Char('a')]);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd *"]
+        );
+    }
+
+    #[test]
+    fn fixed_shape_tool_ignores_cycling() {
+        let mut prompt = open_with(ToolKey::native("webfetch"), URL_SCOPE);
+        press(
+            &mut prompt,
+            &[KeyCode::Char('s'), KeyCode::Right, KeyCode::Left],
+        );
+        assert_eq!(state_of(&prompt), PromptState::ConfirmAllowSession);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec![URL_SCOPE]
+        );
+    }
+
+    #[test]
+    fn deny_confirm_does_not_cycle() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char('d'), KeyCode::Right]);
+        assert_eq!(state_of(&prompt), PromptState::Normal);
+    }
+
     #[test]
     fn wildcard_tool_key_opens() {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, true, None);
+        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, None, true, None);
         assert!(prompt.is_open());
     }
 
@@ -716,6 +1181,7 @@ mod tests {
             ToolKey::native("bash"),
             vec!["execute".into()],
             None,
+            None,
             true,
             reason.map(str::to_owned),
         );
@@ -731,5 +1197,183 @@ mod tests {
                 .then(|| text.trim_start()[WHY_LABEL.len()..].trim().to_owned())
         });
         assert_eq!(why_row.as_deref(), reason);
+    }
+
+    const LS_SCOPE: &str = "ls -la";
+
+    fn open_two_scopes() -> PermissionPrompt {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec![CD_SCOPE.into(), LS_SCOPE.into()],
+            None,
+            None,
+            true,
+            None,
+        );
+        prompt
+    }
+
+    fn type_text(prompt: &mut PermissionPrompt, text: &str) {
+        let codes: Vec<KeyCode> = text.chars().map(KeyCode::Char).collect();
+        press(prompt, &codes);
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn editing(prompt: &PermissionPrompt) -> bool {
+        prompt
+            .queue
+            .front()
+            .is_some_and(|request| request.rule_editor.is_some())
+    }
+
+    fn scope_marks(prompt: &PermissionPrompt) -> Vec<&'static str> {
+        prompt
+            .build_lines()
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter_map(|span| {
+                [MATCH_MARK, MISS_MARK]
+                    .into_iter()
+                    .find(|mark| span.content == *mark)
+            })
+            .collect()
+    }
+
+    /// `e` seeds one editable row per proposed rule with the cursor at the
+    /// end, so typing extends the rule and the confirm writes what was typed.
+    #[test_case('s' => matches Some(PermissionAnswer::AllowSession { .. }) ; "session")]
+    #[test_case('a' => matches Some(PermissionAnswer::AllowAlwaysProject { .. }) ; "project")]
+    #[test_case('A' => matches Some(PermissionAnswer::AllowAlwaysGlobal { .. }) ; "global")]
+    fn edited_rules_are_committed(open: char) -> Option<PermissionAnswer> {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char(open), KeyCode::Char('e')]);
+        assert!(editing(&prompt));
+        press(&mut prompt, &[KeyCode::Backspace]);
+        type_text(&mut prompt, "/repo/*");
+        press(&mut prompt, &[KeyCode::Enter]);
+        assert!(!editing(&prompt));
+        let answered = prompt
+            .handle_key(key(KeyCode::Enter))
+            .expect("an answer");
+        assert_eq!(rules_of(Some(answered.answer.clone())), vec!["cd /repo/*"]);
+        Some(answered.answer)
+    }
+
+    #[test]
+    fn esc_reverts_edits_to_the_shape_rules() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char('s'), KeyCode::Char('e')]);
+        type_text(&mut prompt, "junk");
+        press(&mut prompt, &[KeyCode::Esc]);
+        assert_eq!(state_of(&prompt), PromptState::ConfirmAllowSession);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd *"]
+        );
+    }
+
+    #[test]
+    fn up_down_pick_the_row_and_clamp_at_the_ends() {
+        let mut prompt = open_two_scopes();
+        press(
+            &mut prompt,
+            &[
+                KeyCode::Char('s'),
+                KeyCode::Char('e'),
+                KeyCode::Down,
+                KeyCode::Down,
+            ],
+        );
+        type_text(&mut prompt, "x");
+        press(&mut prompt, &[KeyCode::Up, KeyCode::Up]);
+        type_text(&mut prompt, "y");
+        press(&mut prompt, &[KeyCode::Enter]);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd *y", "ls *x"]
+        );
+    }
+
+    #[test]
+    fn emptied_rows_are_dropped_on_accept() {
+        let mut prompt = open_two_scopes();
+        press(&mut prompt, &[KeyCode::Char('s'), KeyCode::Char('e')]);
+        assert!(prompt.handle_key(ctrl('a')).is_none());
+        assert!(prompt.handle_key(ctrl('k')).is_none());
+        press(&mut prompt, &[KeyCode::Enter]);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["ls *"]
+        );
+    }
+
+    #[test]
+    fn cycling_the_shape_replaces_edited_rules() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char('s'), KeyCode::Char('e')]);
+        type_text(&mut prompt, "x");
+        press(&mut prompt, &[KeyCode::Enter, KeyCode::Right]);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec![CD_SCOPE]
+        );
+    }
+
+    #[test]
+    fn cancelled_confirm_keeps_edited_rules() {
+        let mut prompt = open_with(ToolKey::native("bash"), CD_SCOPE);
+        press(&mut prompt, &[KeyCode::Char('s'), KeyCode::Char('e')]);
+        type_text(&mut prompt, "x");
+        press(&mut prompt, &[KeyCode::Enter, KeyCode::Esc]);
+        assert_eq!(state_of(&prompt), PromptState::Normal);
+        press(&mut prompt, &[KeyCode::Char('a')]);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd *x"]
+        );
+    }
+
+    #[test]
+    fn preview_follows_editing_from_the_initial_prompt() {
+        let mut prompt = open_two_scopes();
+        press(&mut prompt, &[KeyCode::Char('e')]);
+        assert_eq!(scope_marks(&prompt), vec![MATCH_MARK, MATCH_MARK]);
+    }
+
+    #[test]
+    fn paste_lands_in_the_selected_rule() {
+        let mut prompt = open_two_scopes();
+        press(
+            &mut prompt,
+            &[KeyCode::Char('s'), KeyCode::Char('e'), KeyCode::Down],
+        );
+        assert!(prompt.handle_paste(" --color"));
+        press(&mut prompt, &[KeyCode::Enter]);
+        assert_eq!(
+            rules_of(answer(&mut prompt, key(KeyCode::Enter))),
+            vec!["cd *", "ls * --color"]
+        );
+    }
+
+    /// The preview follows the rules as they are typed: a rule that no longer
+    /// covers its scope flips that scope red before the edit is accepted.
+    #[test]
+    fn preview_marks_scopes_by_the_live_rules() {
+        let mut prompt = open_two_scopes();
+        assert!(scope_marks(&prompt).is_empty());
+        press(&mut prompt, &[KeyCode::Char('s')]);
+        assert_eq!(scope_marks(&prompt), vec![MATCH_MARK, MATCH_MARK]);
+        press(&mut prompt, &[KeyCode::Char('e'), KeyCode::Backspace]);
+        type_text(&mut prompt, "/other/*");
+        assert_eq!(scope_marks(&prompt), vec![MISS_MARK, MATCH_MARK]);
+        press(&mut prompt, &[KeyCode::Enter]);
+        assert_eq!(scope_marks(&prompt), vec![MISS_MARK, MATCH_MARK]);
+        press(&mut prompt, &[KeyCode::Esc]);
+        assert!(scope_marks(&prompt).is_empty());
     }
 }

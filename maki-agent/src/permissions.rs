@@ -34,6 +34,20 @@ const BASH_TOOL: &str = "bash";
 /// deny guidance holding one still round-trips.
 const ANSWER_ID_SEPARATOR: char = '\u{1f}';
 
+const ANSWER_ALLOW_SESSION: &str = "allow_session";
+const ANSWER_ALLOW_ALWAYS_PROJECT: &str = "allow_always_project";
+const ANSWER_ALLOW_ALWAYS_GLOBAL: &str = "allow_always_global";
+const ANSWER_PAYLOAD_SEPARATOR: char = ':';
+
+/// Bash builtins whose first argument is a directory, so a rule can be pinned
+/// to that directory instead of to the builtin. See [`RuleShape::PathScoped`].
+const PATH_COMMANDS: [&str; 3] = ["cd", "pushd", "popd"];
+
+const BASH_RULE_SHAPES: [RuleShape; 3] =
+    [RuleShape::Wildcard, RuleShape::Exact, RuleShape::PathScoped];
+const FILE_WRITE_RULE_SHAPES: [RuleShape; 2] = [RuleShape::Wildcard, RuleShape::Exact];
+const FIXED_RULE_SHAPES: [RuleShape; 1] = [RuleShape::Wildcard];
+
 /// Words that open a block the bash plugin keeps as one scope. Their first
 /// token names no program, so wildcarding it would cover every command the
 /// block can hold. See [`generalize_bash_segment`].
@@ -79,6 +93,7 @@ pub enum PermissionCheck {
         tool: ToolKey,
         scopes: Vec<String>,
         force_prompt: bool,
+        context: Option<String>,
     },
 }
 
@@ -155,12 +170,16 @@ impl ApprovalGate {
     }
 }
 
+/// The three rule-writing allows carry the rules to write. Empty `rules`
+/// means "derive them with [`generalized_scopes`]", which is what every
+/// non-TUI host sends and what the wire format looked like before proposals
+/// existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionAnswer {
     AllowOnce,
-    AllowSession,
-    AllowAlwaysProject,
-    AllowAlwaysGlobal,
+    AllowSession { rules: Vec<String> },
+    AllowAlwaysProject { rules: Vec<String> },
+    AllowAlwaysGlobal { rules: Vec<String> },
     Deny,
     DenyWithGuidance(String),
     DenyAlwaysProject,
@@ -171,9 +190,9 @@ impl PermissionAnswer {
     pub fn decision_source(&self) -> &'static str {
         match self {
             Self::AllowOnce | Self::Deny | Self::DenyWithGuidance(_) => DECISION_SOURCE_USER_ONCE,
-            Self::AllowSession => DECISION_SOURCE_USER_SESSION,
-            Self::AllowAlwaysProject
-            | Self::AllowAlwaysGlobal
+            Self::AllowSession { .. } => DECISION_SOURCE_USER_SESSION,
+            Self::AllowAlwaysProject { .. }
+            | Self::AllowAlwaysGlobal { .. }
             | Self::DenyAlwaysProject
             | Self::DenyAlwaysGlobal => DECISION_SOURCE_USER_ALWAYS,
         }
@@ -183,18 +202,27 @@ impl PermissionAnswer {
         matches!(
             self,
             Self::AllowOnce
-                | Self::AllowSession
-                | Self::AllowAlwaysProject
-                | Self::AllowAlwaysGlobal
+                | Self::AllowSession { .. }
+                | Self::AllowAlwaysProject { .. }
+                | Self::AllowAlwaysGlobal { .. }
         )
+    }
+
+    fn rules(&self) -> &[String] {
+        match self {
+            Self::AllowSession { rules }
+            | Self::AllowAlwaysProject { rules }
+            | Self::AllowAlwaysGlobal { rules } => rules,
+            _ => &[],
+        }
     }
 
     pub fn encode(&self) -> String {
         match self {
             Self::AllowOnce => "allow".to_string(),
-            Self::AllowSession => "allow_session".to_string(),
-            Self::AllowAlwaysProject => "allow_always_project".to_string(),
-            Self::AllowAlwaysGlobal => "allow_always_global".to_string(),
+            Self::AllowSession { rules } => encode_rules(ANSWER_ALLOW_SESSION, rules),
+            Self::AllowAlwaysProject { rules } => encode_rules(ANSWER_ALLOW_ALWAYS_PROJECT, rules),
+            Self::AllowAlwaysGlobal { rules } => encode_rules(ANSWER_ALLOW_ALWAYS_GLOBAL, rules),
             Self::Deny => "deny".to_string(),
             Self::DenyWithGuidance(g) => format!("deny:{g}"),
             Self::DenyAlwaysProject => "deny_always_project".to_string(),
@@ -205,9 +233,9 @@ impl PermissionAnswer {
     pub fn decode(s: &str) -> Option<Self> {
         match s {
             "allow" => Some(Self::AllowOnce),
-            "allow_session" => Some(Self::AllowSession),
-            "allow_always_project" => Some(Self::AllowAlwaysProject),
-            "allow_always_global" => Some(Self::AllowAlwaysGlobal),
+            ANSWER_ALLOW_SESSION => Some(Self::AllowSession { rules: vec![] }),
+            ANSWER_ALLOW_ALWAYS_PROJECT => Some(Self::AllowAlwaysProject { rules: vec![] }),
+            ANSWER_ALLOW_ALWAYS_GLOBAL => Some(Self::AllowAlwaysGlobal { rules: vec![] }),
             "deny" => Some(Self::Deny),
             "deny_always_project" => Some(Self::DenyAlwaysProject),
             "deny_always_global" => Some(Self::DenyAlwaysGlobal),
@@ -219,7 +247,16 @@ impl PermissionAnswer {
                     Some(Self::DenyWithGuidance(guidance.to_string()))
                 }
             }
-            _ => None,
+            _ => {
+                let (token, payload) = s.split_once(ANSWER_PAYLOAD_SEPARATOR)?;
+                let rules: Vec<String> = serde_json::from_str(payload).ok()?;
+                match token {
+                    ANSWER_ALLOW_SESSION => Some(Self::AllowSession { rules }),
+                    ANSWER_ALLOW_ALWAYS_PROJECT => Some(Self::AllowAlwaysProject { rules }),
+                    ANSWER_ALLOW_ALWAYS_GLOBAL => Some(Self::AllowAlwaysGlobal { rules }),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -265,6 +302,18 @@ impl TaggedAnswer {
         let (request_id, answer) = raw.split_once(ANSWER_ID_SEPARATOR)?;
         Some(Self::new(request_id, PermissionAnswer::decode(answer)?))
     }
+}
+
+/// Rules ride behind the token as a JSON array: scopes contain spaces, pipes
+/// and quotes, and JSON is the one list encoding already in the tree. The
+/// payload stays private to `encode`/`decode` so it can change before a
+/// second producer exists.
+fn encode_rules(token: &str, rules: &[String]) -> String {
+    if rules.is_empty() {
+        return token.to_string();
+    }
+    let payload = serde_json::Value::from(rules.to_vec());
+    format!("{token}{ANSWER_PAYLOAD_SEPARATOR}{payload}")
 }
 
 /// Permission rules declared by Lua plugins via
@@ -404,6 +453,7 @@ impl PermissionManager {
         tool: &ToolKey,
         scopes: &[&str],
         force_prompt: bool,
+        context: Option<&str>,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
         let session = self.session_rules();
@@ -510,12 +560,13 @@ impl PermissionManager {
                 tool: tool.clone(),
                 scopes: pending.into_iter().map(|s| s.to_string()).collect(),
                 force_prompt,
+                context: context.map(str::to_owned),
             },
         }
     }
 
     pub fn check(&self, tool: &ToolKey, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
-        self.check_inner(tool, &[scope], false, plan_path)
+        self.check_inner(tool, &[scope], false, None, plan_path)
     }
 
     pub fn check_multi(
@@ -525,7 +576,7 @@ impl PermissionManager {
         force_prompt: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        self.check_inner(tool, scopes, force_prompt, plan_path)
+        self.check_inner(tool, scopes, force_prompt, None, plan_path)
     }
 
     pub fn add_session_rule(&self, rule: PermissionRule) {
@@ -605,16 +656,20 @@ impl PermissionManager {
     /// user's own config and no repository can touch.
     fn persist_target(&self, answer: &PermissionAnswer) -> Option<PermissionTarget> {
         match answer {
-            PermissionAnswer::AllowAlwaysProject | PermissionAnswer::DenyAlwaysProject => self
-                .project_config
-                .is_trusted()
-                .then(|| PermissionTarget::Project(self.project_config.clone())),
+            PermissionAnswer::AllowAlwaysProject { .. } | PermissionAnswer::DenyAlwaysProject => {
+                self.project_config
+                    .is_trusted()
+                    .then(|| PermissionTarget::Project(self.project_config.clone()))
+            }
             _ => Some(PermissionTarget::Global),
         }
     }
 
     pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
-        let resolved = if answer.is_allow() || tool.is_mcp() {
+        let proposed = answer.rules();
+        let resolved = if !proposed.is_empty() {
+            proposed.to_vec()
+        } else if answer.is_allow() || tool.is_mcp() {
             // MCP scopes are always wildcarded — both allow and deny generalize to "*".
             // This makes session and persisted rules consistent: a deny on an MCP tool
             // blocks the tool entirely, not just the specific input that triggered it.
@@ -627,7 +682,7 @@ impl PermissionManager {
             PermissionAnswer::AllowOnce
             | PermissionAnswer::Deny
             | PermissionAnswer::DenyWithGuidance(_) => {}
-            PermissionAnswer::AllowSession => {
+            PermissionAnswer::AllowSession { .. } => {
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
                         tool: tool.clone(),
@@ -636,8 +691,8 @@ impl PermissionManager {
                     });
                 }
             }
-            PermissionAnswer::AllowAlwaysProject
-            | PermissionAnswer::AllowAlwaysGlobal
+            PermissionAnswer::AllowAlwaysProject { .. }
+            | PermissionAnswer::AllowAlwaysGlobal { .. }
             | PermissionAnswer::DenyAlwaysProject
             | PermissionAnswer::DenyAlwaysGlobal => {
                 let effect = if answer.is_allow() {
@@ -677,13 +732,14 @@ impl PermissionManager {
         scopes: &[&str],
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        match self.check_inner(tool, scopes, true, plan_path) {
+        match self.check_inner(tool, scopes, true, None, plan_path) {
             PermissionCheck::Denied => PermissionCheck::Denied,
             PermissionCheck::Allowed | PermissionCheck::NeedsPrompt { .. } => {
                 PermissionCheck::NeedsPrompt {
                     tool: tool.clone(),
                     scopes: scopes.iter().map(|s| s.to_string()).collect(),
                     force_prompt: true,
+                    context: None,
                 }
             }
         }
@@ -703,9 +759,10 @@ impl PermissionManager {
         plan_path: Option<&Path>,
         ask: Option<&str>,
     ) -> Result<(), PermissionError> {
+        let scopes_ctx = scopes.context.as_deref();
         let check = |tool: &ToolKey, scopes: &[&str], force_prompt: bool| match ask {
             Some(_) => self.check_escalated(tool, scopes, plan_path),
-            None => self.check_inner(tool, scopes, force_prompt, plan_path),
+            None => self.check_inner(tool, scopes, force_prompt, scopes_ctx, plan_path),
         };
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
@@ -738,6 +795,7 @@ impl PermissionManager {
                 tool,
                 scopes,
                 force_prompt,
+                ..
             } => (tool, scopes, force_prompt),
         };
 
@@ -748,10 +806,15 @@ impl PermissionManager {
 
         let guard = rx.lock().await;
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
-        let (t2, s2) = match check(&pt, &refs, force_prompt) {
+        let (t2, s2, c2) = match check(&pt, &refs, force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
             PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
-            PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
+            PermissionCheck::NeedsPrompt {
+                tool,
+                scopes,
+                context,
+                ..
+            } => (tool, scopes, context),
         };
 
         let _ = event_tx.send(AgentEvent::PermissionRequest {
@@ -759,6 +822,7 @@ impl PermissionManager {
             tool: t2.clone(),
             scopes: s2.clone(),
             reason: ask.map(str::to_owned),
+            context: c2,
         });
         // Only the answer naming this ask may be applied. Anything else is a
         // leftover from a cancelled or reassigned ask, so it is dropped and the
@@ -944,13 +1008,73 @@ fn generalize_bash_segment(segment: &str) -> String {
     }
 }
 
-pub fn generalized_scopes(tool: &ToolKey, scopes: &[String]) -> Vec<String> {
+/// `cd /repo` becomes `cd /repo *`: it still matches the bare command (see
+/// [`scope_matches`]) but not `cd` anywhere else. A builtin without a path
+/// argument, or with a flag in its place, has nothing to pin to and takes the
+/// wildcard shape.
+fn path_scoped_bash_segment(segment: &str) -> Vec<String> {
+    let mut tokens = segment.split_whitespace();
+    match (tokens.next(), tokens.next()) {
+        (Some(cmd), Some(arg)) if PATH_COMMANDS.contains(&cmd) && !arg.starts_with('-') => {
+            vec![format!("{cmd} {arg}"), format!("{cmd} {arg}/*")]
+        }
+        _ => vec![generalize_bash_segment(segment)],
+    }
+}
+
+/// How wide a rule an approval should write. `Wildcard` is the shape every
+/// approval took before the human could choose, so it is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuleShape {
+    Exact,
+    #[default]
+    Wildcard,
+    PathScoped,
+}
+
+/// The shapes a host may offer for `tool`, in cycling order. A single entry
+/// means the shape is not the human's to choose: MCP scopes are stringified
+/// JSON that no prefix rule can safely cover, and the remaining native tools
+/// have no generalization to trade away.
+pub fn rule_shapes(tool: &ToolKey) -> &'static [RuleShape] {
+    match tool {
+        ToolKey::Native(name) if name.as_ref() == BASH_TOOL => &BASH_RULE_SHAPES,
+        ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()) => {
+            &FILE_WRITE_RULE_SHAPES
+        }
+        _ => &FIXED_RULE_SHAPES,
+    }
+}
+
+/// The rules an approval of `scopes` would write under `shape`, deduplicated
+/// in scope order. A scope may propose more than one rule: a path-scoped `cd`
+/// needs the exact directory and a `/*` child rule, since `" *"` patterns
+/// cover "bare or more args", not paths below it. MCP ignores the shape (see
+/// [`rule_shapes`]).
+pub fn proposed_rules(tool: &ToolKey, scopes: &[String], shape: RuleShape) -> Vec<String> {
     let mut seen = HashSet::new();
     scopes
         .iter()
-        .map(|s| generalize_scope(tool, s))
+        .flat_map(|s| propose_scope(tool, s, shape))
         .filter(|g| seen.insert(g.clone()))
         .collect()
+}
+
+pub fn generalized_scopes(tool: &ToolKey, scopes: &[String]) -> Vec<String> {
+    proposed_rules(tool, scopes, RuleShape::Wildcard)
+}
+
+fn propose_scope(tool: &ToolKey, scope: &str, shape: RuleShape) -> Vec<String> {
+    match (tool, shape) {
+        (ToolKey::McpTool { .. } | ToolKey::McpServer { .. }, _) => {
+            vec![generalize_scope(tool, scope)]
+        }
+        (_, RuleShape::Exact) => vec![scope.to_string()],
+        (ToolKey::Native(name), RuleShape::PathScoped) if name.as_ref() == BASH_TOOL => {
+            path_scoped_bash_segment(scope)
+        }
+        (_, RuleShape::Wildcard | RuleShape::PathScoped) => vec![generalize_scope(tool, scope)],
+    }
 }
 
 fn generalize_scope(tool: &ToolKey, scope: &str) -> String {
@@ -1224,7 +1348,13 @@ mod tests {
         assert!(scope_matches(&rule, &scope), "{rule} misses {scope}");
 
         let mgr = mgr_with(PermissionsConfig::default(), project.path().to_path_buf());
-        mgr.apply_decision(&write, &[scope], &PermissionAnswer::AllowSession);
+        mgr.apply_decision(
+            &write,
+            &[scope],
+            &PermissionAnswer::AllowSession {
+                rules: vec![rule.clone()],
+            },
+        );
         for outside in OUTSIDE_WRITES {
             assert_eq!(
                 outcome(mgr.check(&write, outside, None)),
@@ -1393,7 +1523,7 @@ mod tests {
         mgr.apply_decision(
             &ToolKey::native("bash"),
             &["cargo test --all".into()],
-            &PermissionAnswer::AllowSession,
+            &PermissionAnswer::AllowSession { rules: vec![] },
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo build", None),
@@ -1425,9 +1555,9 @@ mod tests {
     /// for deny as much as for allow, because declining to trust a checkout
     /// has to leave nothing behind in it. The deny that lasts is the global
     /// one.
-    #[test_case(PermissionAnswer::AllowAlwaysProject, true, true ; "allow_is_written_when_trusted")]
+    #[test_case(PermissionAnswer::AllowAlwaysProject { rules: vec![] }, true, true ; "allow_is_written_when_trusted")]
     #[test_case(PermissionAnswer::DenyAlwaysProject, false, true ; "deny_is_written_when_trusted")]
-    #[test_case(PermissionAnswer::AllowAlwaysProject, true, false ; "allow_stays_in_the_session_when_untrusted")]
+    #[test_case(PermissionAnswer::AllowAlwaysProject { rules: vec![] }, true, false ; "allow_stays_in_the_session_when_untrusted")]
     #[test_case(PermissionAnswer::DenyAlwaysProject, false, false ; "deny_stays_in_the_session_when_untrusted")]
     fn project_answer_is_written_only_in_a_trusted_folder(
         answer: PermissionAnswer,
@@ -1544,16 +1674,19 @@ mod tests {
     fn permission_answer_roundtrip() {
         for a in [
             PermissionAnswer::AllowOnce,
-            PermissionAnswer::AllowSession,
-            PermissionAnswer::AllowAlwaysProject,
+            PermissionAnswer::AllowSession { rules: vec![] },
+            PermissionAnswer::AllowAlwaysProject { rules: vec![] },
+            PermissionAnswer::AllowAlwaysGlobal { rules: vec![] },
             PermissionAnswer::Deny,
             PermissionAnswer::DenyWithGuidance("hint".into()),
+            PermissionAnswer::DenyAlwaysProject,
+            PermissionAnswer::DenyAlwaysGlobal,
         ] {
             assert_eq!(PermissionAnswer::decode(&a.encode()), Some(a));
         }
     }
 
-    #[test_case(PermissionAnswer::AllowAlwaysProject ; "allow")]
+    #[test_case(PermissionAnswer::AllowAlwaysProject { rules: vec![] } ; "allow")]
     #[test_case(PermissionAnswer::Deny ; "deny")]
     #[test_case(PermissionAnswer::DenyWithGuidance(TAGGED_GUIDANCE.into()) ; "guidance_with_separator")]
     fn tagged_answer_roundtrip(answer: PermissionAnswer) {
@@ -1567,6 +1700,64 @@ mod tests {
     #[test_case("{\"json\": true}" ; "elicitation_result")]
     fn untagged_payloads_never_decode_to_an_answer(raw: &str) {
         assert_eq!(TaggedAnswer::decode(raw), None);
+    }
+
+    /// Hosts that never propose rules (ACP, SDK) keep sending and receiving
+    /// the bare tokens, so an empty proposal must not grow a payload.
+    #[test_case(PermissionAnswer::AllowSession { rules: vec![] }, "allow_session" ; "session")]
+    #[test_case(PermissionAnswer::AllowAlwaysProject { rules: vec![] }, "allow_always_project" ; "always_project")]
+    #[test_case(PermissionAnswer::AllowAlwaysGlobal { rules: vec![] }, "allow_always_global" ; "always_global")]
+    fn empty_rules_encode_as_plain_token(answer: PermissionAnswer, token: &str) {
+        assert_eq!(answer.encode(), token);
+        assert_eq!(PermissionAnswer::decode(token), Some(answer));
+    }
+
+    #[test_case("cargo test --all" ; "spaces")]
+    #[test_case("echo a | grep b" ; "pipes")]
+    #[test_case("echo \"hi\" 'there' \\ end" ; "quotes_and_backslash")]
+    #[test_case("echo héllo 日本語 🍣" ; "unicode")]
+    #[test_case("deny:looks like guidance" ; "deny_lookalike")]
+    #[test_case("allow_session:[\"nested\"]" ; "payload_lookalike")]
+    #[test_case("" ; "empty_rule")]
+    fn proposed_rules_roundtrip(rule: &str) {
+        let rules = vec![rule.to_string(), "cd /repo *".to_string()];
+        for answer in [
+            PermissionAnswer::AllowSession {
+                rules: rules.clone(),
+            },
+            PermissionAnswer::AllowAlwaysProject {
+                rules: rules.clone(),
+            },
+            PermissionAnswer::AllowAlwaysGlobal {
+                rules: rules.clone(),
+            },
+        ] {
+            assert_eq!(PermissionAnswer::decode(&answer.encode()), Some(answer));
+        }
+    }
+
+    /// A proposal the agent cannot read must deny, never fall back to a
+    /// generalized allow: the human approved a rule we could not recover.
+    #[test_case("allow_session:" ; "empty_payload")]
+    #[test_case("allow_session:cargo *" ; "unquoted_payload")]
+    #[test_case("allow_session:\"cargo *\"" ; "bare_string_payload")]
+    #[test_case("allow_session:[1]" ; "non_string_item")]
+    #[test_case("allow_session:{\"rules\":[]}" ; "object_payload")]
+    #[test_case("allow_session:[\"x\"] trailing" ; "trailing_garbage")]
+    #[test_case("allow:[\"x\"]" ; "allow_once_takes_no_rules")]
+    #[test_case("deny_always_project:[\"x\"]" ; "deny_takes_no_rules")]
+    #[test_case("allow_session [\"x\"]" ; "missing_separator")]
+    #[test_case("bogus" ; "unknown_token")]
+    fn malformed_answers_fail_closed(raw: &str) {
+        assert_eq!(PermissionAnswer::decode(raw), None);
+    }
+
+    #[test_case(PermissionAnswer::AllowSession { rules: vec!["x".into()] }, DECISION_SOURCE_USER_SESSION ; "session")]
+    #[test_case(PermissionAnswer::AllowAlwaysProject { rules: vec!["x".into()] }, DECISION_SOURCE_USER_ALWAYS ; "always_project")]
+    #[test_case(PermissionAnswer::AllowAlwaysGlobal { rules: vec!["x".into()] }, DECISION_SOURCE_USER_ALWAYS ; "always_global")]
+    fn proposed_rules_keep_allow_semantics(answer: PermissionAnswer, source: &str) {
+        assert!(answer.is_allow());
+        assert_eq!(answer.decision_source(), source);
     }
 
     #[test]
@@ -1660,7 +1851,7 @@ mod tests {
         mgr.apply_decision(
             &ToolKey::native("bash"),
             &["cargo test".into(), "git status".into()],
-            &PermissionAnswer::AllowSession,
+            &PermissionAnswer::AllowSession { rules: vec![] },
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo build", None),
@@ -1684,6 +1875,140 @@ mod tests {
         let scopes = vec!["cargo test".into(), "git status".into()];
         let result = generalized_scopes(&ToolKey::native("bash"), &scopes);
         assert_eq!(result, vec!["cargo *", "git *"]);
+    }
+
+    #[test_case("cd", RuleShape::PathScoped => "cd *" ; "bare_cd_has_no_path")]
+    #[test_case("cd -P /repo", RuleShape::PathScoped => "cd *" ; "flag_is_not_a_path")]
+    #[test_case("cargo test --all", RuleShape::PathScoped => "cargo *" ; "non_path_command_falls_back")]
+    #[test_case("cd /repo", RuleShape::Exact => "cd /repo" ; "exact_keeps_segment")]
+    #[test_case("for f in *.rs; do cd $f; done", RuleShape::Exact => "for f in *.rs; do cd $f; done" ; "exact_keeps_block")]
+    #[test_case("cd /repo", RuleShape::Wildcard => "cd *" ; "wildcard_is_today")]
+    fn proposed_bash_rule(segment: &str, shape: RuleShape) -> String {
+        proposed_rules(&ToolKey::native("bash"), &[segment.into()], shape).remove(0)
+    }
+
+    #[test]
+    fn path_scoped_cd_covers_directory_and_below() {
+        assert_eq!(
+            proposed_rules(
+                &ToolKey::native("bash"),
+                &["cd /repo".into()],
+                RuleShape::PathScoped
+            ),
+            vec!["cd /repo", "cd /repo/*"]
+        );
+    }
+
+    #[test]
+    fn path_scoped_pushd_covers_directory_and_below() {
+        assert_eq!(
+            proposed_rules(
+                &ToolKey::native("bash"),
+                &["pushd src/lib".into()],
+                RuleShape::PathScoped
+            ),
+            vec!["pushd src/lib", "pushd src/lib/*"]
+        );
+    }
+
+    #[test_case(RuleShape::Wildcard => vec!["cargo *"] ; "wildcard_groups_binary")]
+    #[test_case(RuleShape::Exact => vec!["cargo test", "cargo build"] ; "exact_keeps_each")]
+    #[test_case(RuleShape::PathScoped => vec!["cargo *"] ; "path_scoped_dedups_fallback")]
+    fn proposed_rules_dedup_per_shape(shape: RuleShape) -> Vec<String> {
+        let scopes = vec!["cargo test".into(), "cargo build".into()];
+        proposed_rules(&ToolKey::native("bash"), &scopes, shape)
+    }
+
+    #[test_case("edit", "/home/user/project/src/main.rs", RuleShape::Exact => "/home/user/project/src/main.rs" ; "file_write_exact_is_the_file")]
+    #[test_case("edit", "/home/user/project/src/main.rs", RuleShape::Wildcard => "/home/user/project/src/**" ; "file_write_wildcard_is_parent")]
+    #[test_case("edit", "/home/user/project/src/main.rs", RuleShape::PathScoped => "/home/user/project/src/**" ; "file_write_has_no_path_shape")]
+    #[test_case("webfetch", "https://example.com", RuleShape::Exact => "https://example.com" ; "other_native_exact")]
+    #[test_case("webfetch", "https://example.com", RuleShape::Wildcard => "https://example.com" ; "other_native_has_no_generalization")]
+    #[test_case("myserver.fetch", "{\"url\":\"https://a\"}", RuleShape::Exact => "*" ; "mcp_ignores_exact")]
+    #[test_case("myserver.fetch", "{\"url\":\"https://a\"}", RuleShape::PathScoped => "*" ; "mcp_ignores_path_scoped")]
+    fn proposed_rule_for_tool(tool: &str, scope: &str, shape: RuleShape) -> String {
+        proposed_rules(&ToolKey::parse(tool).unwrap(), &[scope.into()], shape).remove(0)
+    }
+
+    #[test_case("bash" => vec![RuleShape::Wildcard, RuleShape::Exact, RuleShape::PathScoped] ; "bash_offers_all")]
+    #[test_case("edit" => vec![RuleShape::Wildcard, RuleShape::Exact] ; "file_write_offers_exact")]
+    #[test_case("webfetch" => vec![RuleShape::Wildcard] ; "other_native_is_fixed")]
+    #[test_case("myserver.fetch" => vec![RuleShape::Wildcard] ; "mcp_is_fixed")]
+    fn offered_rule_shapes(tool: &str) -> Vec<RuleShape> {
+        rule_shapes(&ToolKey::parse(tool).unwrap()).to_vec()
+    }
+
+    #[test]
+    fn default_rule_shape_is_wildcard() {
+        assert_eq!(RuleShape::default(), RuleShape::Wildcard);
+    }
+
+    /// The prompt shows the rule it will write, so whatever shape the human
+    /// picks must still match the command that raised the prompt.
+    #[test_case("cd /repo", RuleShape::PathScoped ; "path_scoped_cd")]
+    #[test_case("cd", RuleShape::PathScoped ; "path_scoped_bare_cd")]
+    #[test_case("git status --short", RuleShape::Exact ; "exact_command")]
+    #[test_case("for f in *.rs; do cd $f; done", RuleShape::PathScoped ; "path_scoped_block")]
+    fn command_matches_its_own_proposed_rule(scope: &str, shape: RuleShape) {
+        let rule = proposed_rules(&ToolKey::native("bash"), &[scope.into()], shape).remove(0);
+        assert!(
+            scope_matches(&rule, scope),
+            "{scope:?} does not match its proposed rule {rule:?}"
+        );
+    }
+
+    #[test]
+    fn session_decision_writes_proposed_rules_verbatim() {
+        let mgr = default_mgr();
+        mgr.apply_decision(
+            &ToolKey::native("bash"),
+            &["cd /repo".into(), "cargo test".into()],
+            &PermissionAnswer::AllowSession {
+                rules: vec!["cd /repo *".into(), "cargo test".into()],
+            },
+        );
+        let scopes: Vec<Option<String>> = mgr
+            .session_rules_snapshot()
+            .into_iter()
+            .map(|r| r.scope)
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![Some("cd /repo *".into()), Some("cargo test".into())]
+        );
+        assert!(matches!(
+            mgr.check(&ToolKey::native("bash"), "cd /repo", None),
+            PermissionCheck::Allowed
+        ));
+        assert!(matches!(
+            mgr.check(&ToolKey::native("bash"), "cd /elsewhere", None),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
+        assert!(matches!(
+            mgr.check(&ToolKey::native("bash"), "cargo build", None),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
+    }
+
+    #[test]
+    fn always_project_decision_persists_proposed_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = mgr_with(PermissionsConfig::default(), dir.path().to_path_buf());
+        mgr.apply_decision(
+            &ToolKey::native("bash"),
+            &["cargo test".into()],
+            &PermissionAnswer::AllowAlwaysProject {
+                rules: vec!["cargo test".into()],
+            },
+        );
+        let persisted =
+            std::fs::read_to_string(dir.path().join(".maki").join("permissions.toml")).unwrap();
+        assert!(persisted.contains("cargo test"), "{persisted}");
+        assert!(!persisted.contains("cargo *"), "{persisted}");
+        assert!(matches!(
+            mgr.check(&ToolKey::native("bash"), "cargo build", None),
+            PermissionCheck::NeedsPrompt { .. }
+        ));
     }
 
     #[test_case("webfetch", "some:scope" => "some:scope" ; "unknown_tool_preserves_exact")]
@@ -1745,7 +2070,7 @@ mod tests {
         mgr.apply_decision(
             &ToolKey::parse("myfetch.search").unwrap(),
             &["{\"url\":\"https://a\"}".into()],
-            &PermissionAnswer::AllowSession,
+            &PermissionAnswer::AllowSession { rules: vec![] },
         );
         // Same tool, different arguments -> allowed without reprompting.
         assert!(matches!(

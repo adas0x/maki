@@ -52,6 +52,7 @@ pub enum ChatEventResult {
         tool: ToolKey,
         scopes: Vec<String>,
         reason: Option<String>,
+        context: Option<String>,
     },
     AuthRequired,
 }
@@ -207,12 +208,14 @@ impl Chat {
                 tool,
                 scopes,
                 reason,
+                context,
             } => {
                 return ChatEventResult::PermissionRequest {
                     id,
                     tool,
                     scopes,
                     reason,
+                    context,
                 };
             }
             AgentEvent::Steered { kind, text } => {
@@ -1543,6 +1546,7 @@ mod tests {
                 tool: ToolKey::native("bash"),
                 scopes: Vec::new(),
                 reason: Some(ASK_REASON.into()),
+                context: None,
             },
             None,
         );

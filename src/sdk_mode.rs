@@ -917,7 +917,9 @@ fn resolve_model_spec(model_id: &str) -> String {
 
 fn decode_permission_response(data: &Value) -> PermissionAnswer {
     match data.get("behavior").and_then(Value::as_str) {
-        Some("allow") if data.get("updatedPermissions").is_some() => PermissionAnswer::AllowSession,
+        Some("allow") if data.get("updatedPermissions").is_some() => {
+            PermissionAnswer::AllowSession { rules: vec![] }
+        }
         Some("allow") => PermissionAnswer::AllowOnce,
         Some("deny") => match data.get("message").and_then(Value::as_str) {
             Some(msg) if !msg.is_empty() => PermissionAnswer::DenyWithGuidance(msg.to_string()),
@@ -1123,7 +1125,7 @@ impl EventPump {
                     if shared.permission_mode == PermissionMode::BypassPermissions {
                         shared
                             .permissions
-                            .answer(id, PermissionAnswer::AllowSession);
+                            .answer(id, PermissionAnswer::AllowSession { rules: vec![] });
                         return Ok(());
                     }
                 }
@@ -1532,7 +1534,7 @@ mod tests {
             decode_permission_response(
                 &serde_json::json!({"behavior": "allow", "updatedPermissions": []})
             ),
-            PermissionAnswer::AllowSession
+            PermissionAnswer::AllowSession { .. }
         ));
         assert!(matches!(
             decode_permission_response(&serde_json::json!({})),
@@ -1650,6 +1652,7 @@ mod tests {
                 tool: ToolKey::parse(TEST_TOOL).unwrap(),
                 scopes: Vec::new(),
                 reason: None,
+                context: None,
             },
             subagent: None,
             run_id: 0,
@@ -1747,7 +1750,7 @@ mod tests {
 
         assert_eq!(
             answer_rx.try_recv(),
-            Ok(tagged(PermissionAnswer::AllowSession))
+            Ok(tagged(PermissionAnswer::AllowSession { rules: vec![] }))
         );
         assert!(answer_rx.is_empty(), "{NO_ANSWER}");
         assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
