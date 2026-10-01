@@ -230,9 +230,16 @@ impl Provider for Xai {
             }
 
             let top_p = self.current_auth().top_p;
-            let mut body =
-                self.compat
-                    .build_body(model, messages, system, tools, opts.thinking, top_p);
+            let temperature = self.current_auth().temperature;
+            let mut body = self.compat.build_body(
+                model,
+                messages,
+                system,
+                tools,
+                opts.thinking,
+                top_p,
+                temperature,
+            );
             opts.thinking
                 .apply_reasoning_effort(&mut body, &dialect::GROK, model);
             self.with_oauth_retry(|| async {

@@ -159,9 +159,15 @@ impl Provider for LocalEndpoint {
 
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body =
-                self.compat
-                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
+            let mut body = self.compat.build_body(
+                model,
+                messages,
+                system,
+                tools,
+                opts.thinking,
+                auth.top_p,
+                auth.temperature,
+            );
 
             opts.thinking
                 .apply_thinking(&mut body, model, self.thinking_fallback);

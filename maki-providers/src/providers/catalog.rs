@@ -795,6 +795,7 @@ impl CatalogTransport {
                     tools,
                     opts.thinking,
                     auth.top_p,
+                    auth.temperature,
                 );
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::PREFER_HIGH, model);
