@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 use flume::Sender;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_config::providers::{ProvidersConfig, builtin_provider};
+use maki_config::providers::{ProvidersConfig, builtin_provider, temperature_for, top_p_for};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -740,9 +740,10 @@ pub(crate) struct CatalogTransport {
 }
 
 impl CatalogTransport {
-    pub(crate) fn new(timeouts: Timeouts) -> Self {
+    pub(crate) fn new(timeouts: Timeouts, slug: &str) -> Self {
         Self {
-            chat_compat: OpenAiCompatProvider::new(&CATALOG_PROVIDER_CONFIG, timeouts),
+            chat_compat: OpenAiCompatProvider::new(&CATALOG_PROVIDER_CONFIG, timeouts)
+                .with_sampling(temperature_for(slug), top_p_for(slug)),
             client: http_client(timeouts),
             stream_timeout: timeouts.stream,
         }
@@ -851,9 +852,9 @@ impl CatalogProvider {
         allow_free_fallback: bool,
     ) -> Result<Self, AgentError> {
         Ok(Self {
+            transport: CatalogTransport::new(timeouts, &data.slug),
             auth: data.catalog_auth(state_dir, allow_free_fallback)?,
             data,
-            transport: CatalogTransport::new(timeouts),
         })
     }
 }
