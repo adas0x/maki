@@ -30,6 +30,10 @@ return function(U)
     if not mod then
       return nil
     end
+    -- Relative paths (Lune, Rojo) carry no module segments, keep them verbatim.
+    if mod:sub(1, 1) == "." then
+      return new_import_entry(node, { { mod } })
+    end
     local path = {}
     for part in mod:gmatch("[^%.]+") do
       path[#path + 1] = part
