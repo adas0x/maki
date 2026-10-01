@@ -2098,6 +2098,7 @@ mod tests {
                 let _ = reply.send(Some(PermissionScopes {
                     scopes: vec!["cargo".into(), "test".into()],
                     force_prompt: false,
+                    context: None,
                 }));
             }
         });

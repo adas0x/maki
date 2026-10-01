@@ -703,6 +703,8 @@ pub enum AgentEvent {
         /// Why a plugin escalated this call to the user, if one did.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
     },
     AuthRequired,
     Nudge,

@@ -93,6 +93,7 @@ pub enum PermissionCheck {
         tool: ToolKey,
         scopes: Vec<String>,
         force_prompt: bool,
+        context: Option<String>,
     },
 }
 
@@ -452,6 +453,7 @@ impl PermissionManager {
         tool: &ToolKey,
         scopes: &[&str],
         force_prompt: bool,
+        context: Option<&str>,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
         let session = self.session_rules();
@@ -558,12 +560,13 @@ impl PermissionManager {
                 tool: tool.clone(),
                 scopes: pending.into_iter().map(|s| s.to_string()).collect(),
                 force_prompt,
+                context: context.map(str::to_owned),
             },
         }
     }
 
     pub fn check(&self, tool: &ToolKey, scope: &str, plan_path: Option<&Path>) -> PermissionCheck {
-        self.check_inner(tool, &[scope], false, plan_path)
+        self.check_inner(tool, &[scope], false, None, plan_path)
     }
 
     pub fn check_multi(
@@ -573,7 +576,7 @@ impl PermissionManager {
         force_prompt: bool,
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        self.check_inner(tool, scopes, force_prompt, plan_path)
+        self.check_inner(tool, scopes, force_prompt, None, plan_path)
     }
 
     pub fn add_session_rule(&self, rule: PermissionRule) {
@@ -729,13 +732,14 @@ impl PermissionManager {
         scopes: &[&str],
         plan_path: Option<&Path>,
     ) -> PermissionCheck {
-        match self.check_inner(tool, scopes, true, plan_path) {
+        match self.check_inner(tool, scopes, true, None, plan_path) {
             PermissionCheck::Denied => PermissionCheck::Denied,
             PermissionCheck::Allowed | PermissionCheck::NeedsPrompt { .. } => {
                 PermissionCheck::NeedsPrompt {
                     tool: tool.clone(),
                     scopes: scopes.iter().map(|s| s.to_string()).collect(),
                     force_prompt: true,
+                    context: None,
                 }
             }
         }
@@ -755,9 +759,10 @@ impl PermissionManager {
         plan_path: Option<&Path>,
         ask: Option<&str>,
     ) -> Result<(), PermissionError> {
+        let scopes_ctx = scopes.context.as_deref();
         let check = |tool: &ToolKey, scopes: &[&str], force_prompt: bool| match ask {
             Some(_) => self.check_escalated(tool, scopes, plan_path),
-            None => self.check_inner(tool, scopes, force_prompt, plan_path),
+            None => self.check_inner(tool, scopes, force_prompt, scopes_ctx, plan_path),
         };
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
@@ -790,6 +795,7 @@ impl PermissionManager {
                 tool,
                 scopes,
                 force_prompt,
+                ..
             } => (tool, scopes, force_prompt),
         };
 
@@ -800,10 +806,15 @@ impl PermissionManager {
 
         let guard = rx.lock().await;
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
-        let (t2, s2) = match check(&pt, &refs, force_prompt) {
+        let (t2, s2, c2) = match check(&pt, &refs, force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
             PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
-            PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
+            PermissionCheck::NeedsPrompt {
+                tool,
+                scopes,
+                context,
+                ..
+            } => (tool, scopes, context),
         };
 
         let _ = event_tx.send(AgentEvent::PermissionRequest {
@@ -811,6 +822,7 @@ impl PermissionManager {
             tool: t2.clone(),
             scopes: s2.clone(),
             reason: ask.map(str::to_owned),
+            context: c2,
         });
         // Only the answer naming this ask may be applied. Anything else is a
         // leftover from a cancelled or reassigned ask, so it is dropped and the

@@ -2859,9 +2859,11 @@ impl LuaRuntime {
             return None;
         }
         let force_prompt: bool = table.get("force_prompt").unwrap_or(false);
+        let context: Option<String> = table.get("context").ok().flatten();
         Some(PermissionScopes {
             scopes,
             force_prompt,
+            context,
         })
     }
 

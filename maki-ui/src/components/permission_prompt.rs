@@ -244,6 +244,7 @@ struct Request {
     id: String,
     tool: ToolKey,
     scopes: Vec<String>,
+    context: Option<String>,
     subagent_id: Option<String>,
     project_trusted: bool,
     /// Set when a plugin escalated the call, so the user sees why they are
@@ -304,6 +305,7 @@ impl PermissionPrompt {
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
+        context: Option<String>,
         subagent_id: Option<String>,
         project_trusted: bool,
         reason: Option<String>,
@@ -314,6 +316,7 @@ impl PermissionPrompt {
             id,
             tool,
             scopes,
+            context,
             subagent_id,
             project_trusted,
             reason,
@@ -548,6 +551,7 @@ impl PermissionPrompt {
         let Some(Request {
             tool,
             scopes,
+            context,
             subagent_id,
             project_trusted,
             reason,
@@ -591,6 +595,13 @@ impl PermissionPrompt {
                 Span::raw("  "),
                 Span::styled("queue ", label_style),
                 Span::styled(format!("{waiting} {QUEUED_NOTICE}"), t.item_desc),
+            ]));
+        }
+        if let Some(cmd) = context.as_ref().filter(|c| !scopes.contains(c)) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("cmd   ", label_style),
+                Span::styled(cmd.clone(), value_style),
             ]));
         }
         for (i, s) in scopes.iter().enumerate() {
@@ -769,7 +780,7 @@ mod tests {
 
     fn open_with(tool: ToolKey, scope: &str) -> PermissionPrompt {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(MAIN_ID.into(), tool, vec![scope.into()], None, true);
+        prompt.push(MAIN_ID.into(), tool, vec![scope.into()], None, None, true, None);
         prompt
     }
 
@@ -778,6 +789,7 @@ mod tests {
             MAIN_ID.into(),
             ToolKey::native("bash"),
             vec!["execute".into()],
+            None,
             None,
             project_trusted,
             None,
@@ -789,6 +801,7 @@ mod tests {
             SUB_ID.into(),
             ToolKey::native("read"),
             vec!["/tmp/x".into()],
+            None,
             Some(SUB_AGENT.into()),
             true,
             None,
@@ -1056,7 +1069,7 @@ mod tests {
     #[test]
     fn wildcard_tool_key_opens() {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, true, None);
+        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, None, true, None);
         assert!(prompt.is_open());
     }
 
@@ -1168,6 +1181,7 @@ mod tests {
             ToolKey::native("bash"),
             vec!["execute".into()],
             None,
+            None,
             true,
             reason.map(str::to_owned),
         );
@@ -1193,6 +1207,7 @@ mod tests {
             MAIN_ID.into(),
             ToolKey::native("bash"),
             vec![CD_SCOPE.into(), LS_SCOPE.into()],
+            None,
             None,
             true,
             None,
