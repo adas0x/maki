@@ -918,6 +918,7 @@ fn start_event_pump(
                     tool,
                     scopes,
                     reason,
+                    ..
                 } => {
                     let tool = tool.to_string();
                     let scope = format!("{tool}: {}", scopes.join(", "));
@@ -1520,6 +1521,7 @@ mod tests {
             tool: ToolKey::native(PERMISSION_TOOL),
             scopes: vec![PUMP_CWD.to_owned()],
             reason: None,
+            context: None,
         }
     }
 
@@ -1592,7 +1594,7 @@ mod tests {
             .zip([
                 PermissionAnswer::Deny,
                 PermissionAnswer::AllowOnce,
-                PermissionAnswer::AllowSession,
+                PermissionAnswer::AllowSession { rules: vec![] },
             ])
             .zip(CHILD_TOOL_USE_IDS.iter().chain([&PARENT_TOOL_USE_ID]))
         {
@@ -1724,7 +1726,7 @@ mod tests {
         );
     }
 
-    #[test_case(PermissionAnswer::AllowSession, true ; "allow_applies_the_decision")]
+    #[test_case(PermissionAnswer::AllowSession { rules: vec![] }, true ; "allow_applies_the_decision")]
     #[test_case(PermissionAnswer::Deny, false ; "deny_applies_the_decision")]
     fn a_matching_answer_is_applied(answer: PermissionAnswer, allowed: bool) {
         let (srv, answer_rx, ..) = test_server();
@@ -1858,6 +1860,7 @@ mod tests {
                     tool: ToolKey::native(PERMISSION_TOOL),
                     scopes: vec![PUMP_CWD.to_owned()],
                     reason: reason.map(str::to_owned),
+                    context: None,
                 })
                 .unwrap();
         });

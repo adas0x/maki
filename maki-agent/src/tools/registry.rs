@@ -175,6 +175,7 @@ impl Future for HeaderFuture {
 pub struct PermissionScopes {
     pub scopes: Vec<String>,
     pub force_prompt: bool,
+    pub context: Option<String>,
 }
 
 impl PermissionScopes {
@@ -182,6 +183,7 @@ impl PermissionScopes {
         Self {
             scopes: vec![scope],
             force_prompt: false,
+            context: None,
         }
     }
 
@@ -189,6 +191,7 @@ impl PermissionScopes {
         Self {
             scopes: vec![scope],
             force_prompt: true,
+            context: None,
         }
     }
 }
