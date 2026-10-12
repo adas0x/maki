@@ -523,9 +523,15 @@ impl Provider for CompatProvider {
                 .await;
             }
 
-            let mut body =
-                self.compat
-                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
+            let mut body = self.compat.build_body(
+                model,
+                messages,
+                system,
+                tools,
+                opts.thinking,
+                auth.top_p,
+                auth.temperature,
+            );
             self.openai.apply_body(&mut body, &ctx);
             if let Some(hook) = &self.build_body {
                 body = hook.call(body, &ctx).await?;

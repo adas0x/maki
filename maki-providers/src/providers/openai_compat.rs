@@ -155,6 +155,7 @@ impl OpenAiCompatProvider {
         Ok(response.text().await?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn build_body(
         &self,
         model: &crate::model::Model,
@@ -163,6 +164,7 @@ impl OpenAiCompatProvider {
         tools: &Value,
         thinking: ThinkingConfig,
         top_p: Option<f64>,
+        temperature: Option<f64>,
     ) -> Value {
         let wire_messages = convert_messages(messages, system);
         let wire_tools = convert_tools(tools);
@@ -181,6 +183,14 @@ impl OpenAiCompatProvider {
             && !rejects_sampling(&model.id)
         {
             body["top_p"] = json!(top_p);
+        }
+        // `temperature` rides the same gate: the models that reject the two
+        // sampling parameters reject them together.
+        if let Some(temperature) = temperature
+            && !(thinking.is_enabled() && model.family == ModelFamily::Gpt)
+            && !rejects_sampling(&model.id)
+        {
+            body["temperature"] = json!(temperature);
         }
         if let Some(max_output) = model.output_tokens() {
             body[&*self.config.max_tokens_field] = json!(max_output);
@@ -1507,6 +1517,7 @@ data: [DONE]\n";
             &json!([]),
             thinking,
             Some(0.8),
+            None,
         );
         assert_eq!(body.get("top_p") == Some(&json!(0.8)), sent);
     }
@@ -1520,7 +1531,49 @@ data: [DONE]\n";
             &json!([]),
             ThinkingConfig::Off,
             None,
+            None,
         );
         assert!(body.get("top_p").is_none());
+    }
+
+    #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]
+    #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Adaptive, false ; "gpt_thinking_omits")]
+    #[test_case("test-model", ModelFamily::Generic, ThinkingConfig::Adaptive, true ; "generic_thinking_sends")]
+    #[test_case("test-model", ModelFamily::Glm, ThinkingConfig::Effort(crate::Effort::High), true ; "glm_effort_sends")]
+    #[test_case("anthropic/claude-opus-4-7", ModelFamily::Generic, ThinkingConfig::Off, false ; "gateway_adaptive_only_claude_omits")]
+    fn build_body_temperature_gated(
+        model_id: &str,
+        family: ModelFamily,
+        thinking: ThinkingConfig,
+        sent: bool,
+    ) {
+        let model = Model {
+            id: model_id.into(),
+            ..test_model(family)
+        };
+        let body = test_provider().build_body(
+            &model,
+            &[Message::user("hi".into())],
+            "",
+            &json!([]),
+            thinking,
+            None,
+            Some(0.7),
+        );
+        assert_eq!(body.get("temperature") == Some(&json!(0.7)), sent);
+    }
+
+    #[test]
+    fn build_body_omits_temperature_when_unset() {
+        let body = test_provider().build_body(
+            &test_model(ModelFamily::Generic),
+            &[Message::user("hi".into())],
+            "",
+            &json!([]),
+            ThinkingConfig::Off,
+            None,
+            None,
+        );
+        assert!(body.get("temperature").is_none());
     }
 }

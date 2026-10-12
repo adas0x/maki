@@ -145,6 +145,9 @@ pub struct ResolvedAuth {
     /// `[<slug>] top_p`, carried with the auth so whoever the slug's
     /// credentials reach (aperture routes, catalog sub-providers) sends it.
     pub top_p: Option<f64>,
+    /// `[<slug>] temperature`, carried alongside `top_p` but sent only on
+    /// OpenAI-compatible request bodies.
+    pub temperature: Option<f64>,
 }
 
 impl ResolvedAuth {
@@ -158,10 +161,12 @@ impl ResolvedAuth {
             headers,
             config_headers: Vec::new(),
             top_p: None,
+            temperature: None,
         };
         if let Some(def) = maki_config::providers::ProvidersConfig::load().get(slug) {
             auth.apply_config_headers(slug, &def.headers)?;
             auth.top_p = def.top_p;
+            auth.temperature = def.temperature;
         }
         Ok(auth)
     }
@@ -206,6 +211,7 @@ impl ResolvedAuth {
             headers: Vec::new(),
             config_headers: Vec::new(),
             top_p: None,
+            temperature: None,
         }
     }
 
@@ -262,6 +268,7 @@ impl ResolvedAuth {
             headers,
             config_headers: Vec::new(),
             top_p: None,
+            temperature: None,
         }
     }
 }

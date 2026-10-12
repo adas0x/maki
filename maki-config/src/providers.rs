@@ -36,6 +36,9 @@ static PARSED: Mutex<Option<(FileStamp, ProvidersConfig)>> = Mutex::new(None);
 const TOP_P_MIN: f64 = 0.0;
 const TOP_P_MAX: f64 = 1.0;
 
+/// Valid `temperature` is finite and at least 0.
+const TEMPERATURE_MIN: f64 = 0.0;
+
 /// The role a model plays, which is what tiered requests dispatch on. Lives
 /// here rather than in maki-providers so `providers.toml` can name it.
 ///
@@ -312,6 +315,15 @@ pub struct ProviderDef {
         deserialize_with = "de_top_p"
     )]
     pub top_p: Option<f64>,
+    /// Sampling temperature sent as `temperature` in the request body to this
+    /// provider. When unset, no `temperature` is sent (the provider's own
+    /// default applies). Must be finite and `>= 0`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_temperature"
+    )]
+    pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub discover_models: bool,
     /// Extra HTTP headers sent with every request to this provider. Values
@@ -675,6 +687,14 @@ pub fn top_p_for(slug: &str) -> Option<f64> {
         .and_then(|def| def.top_p)
 }
 
+/// The `temperature` configured for `slug`, resolved the same way as
+/// [`top_p_for`].
+pub fn temperature_for(slug: &str) -> Option<f64> {
+    ProvidersConfig::load_or_default()
+        .get(slug)
+        .and_then(|def| def.temperature)
+}
+
 fn de_plugin<'de, D>(de: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -700,6 +720,21 @@ where
     {
         return Err(serde::de::Error::custom(format!(
             "top_p must be in ({TOP_P_MIN}, {TOP_P_MAX}], got {v}"
+        )));
+    }
+    Ok(value)
+}
+
+fn de_temperature<'de, D>(de: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(de)?;
+    if let Some(v) = value
+        && (!v.is_finite() || v < TEMPERATURE_MIN)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "temperature must be finite and >= {TEMPERATURE_MIN}, got {v}"
         )));
     }
     Ok(value)
@@ -1078,6 +1113,30 @@ tier = "{input}"
         assert_eq!(def.top_p, Some(1.0));
         let def2: ProviderDef = toml::from_str(&format!("top_p = {}", f64::MIN_POSITIVE)).unwrap();
         assert!(def2.top_p.unwrap() > 0.0);
+    }
+
+    #[test_case(-0.1; "negative")]
+    #[test_case(f64::NEG_INFINITY; "negative_infinity")]
+    #[test_case(f64::INFINITY; "positive_infinity")]
+    fn temperature_out_of_range_rejected(value: f64) {
+        let res = toml::from_str::<ProviderDef>(&format!("temperature = {value}"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn temperature_nan_rejected() {
+        let err = toml::from_str::<ProviderDef>("temperature = nan")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("temperature must be"), "{err}");
+    }
+
+    #[test]
+    fn temperature_boundaries_accepted() {
+        let def: ProviderDef = toml::from_str("temperature = 0.0").unwrap();
+        assert_eq!(def.temperature, Some(0.0));
+        let def2: ProviderDef = toml::from_str(&format!("temperature = {:e}", f64::MAX)).unwrap();
+        assert_eq!(def2.temperature, Some(f64::MAX));
     }
 
     #[test_case("MyProvider", "myprovider"; "mixed_case")]

@@ -401,9 +401,15 @@ impl Provider for Aperture {
             let auth = auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body =
-                self.compat
-                    .build_body(model, messages, system, tools, opts.thinking, auth.top_p);
+            let body = self.compat.build_body(
+                model,
+                messages,
+                system,
+                tools,
+                opts.thinking,
+                auth.top_p,
+                auth.temperature,
+            );
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

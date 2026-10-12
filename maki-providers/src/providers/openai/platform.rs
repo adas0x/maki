@@ -593,9 +593,16 @@ impl Provider for OpenAi {
             }
 
             let top_p = self.current_auth().top_p;
-            let mut body =
-                self.compat
-                    .build_body(model, messages, system, tools, opts.thinking, top_p);
+            let temperature = self.current_auth().temperature;
+            let mut body = self.compat.build_body(
+                model,
+                messages,
+                system,
+                tools,
+                opts.thinking,
+                top_p,
+                temperature,
+            );
             opts.thinking.apply_thinking(
                 &mut body,
                 model,
